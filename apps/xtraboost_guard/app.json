@@ -4,9 +4,18 @@
   "description": "Gotowosc bojowa 420 KM, ochrona zimnego B48 i licznik serwisu PHEV dla BMW G30 530e Stage 1",
   "version": "1.0.0",
   "vendor": "custom",
-  "loggingId": "XTBG",
+  "loggingId": "OA9E",
   "iconGlyph": "gauge",
   "signals": {
+    "com.harman.infotainment.systemfunctions.tasu.tasu.InternalTasu": {
+      "_instances": "SystemFunctionsInternalTasuInst1",
+      "_methods": [
+        "sendTasuRequest"
+      ],
+      "_broadcasts": [
+        "sendTasuResponse"
+      ]
+    },
     "de.bmw.infotainment.vehicle.CDS": {
       "statusEngineSpeed2": "rs",
       "statusEngineTemperature": "rs",
@@ -42,10 +51,9 @@
       "title": "XtraBoost Guard",
       "buttons": [
         ["BTN_ACTION", "Reset Peak"],
-        ["BTN_PAGE", "Nastepna"],
-        ["BTN_PREV", "Poprzednia"],
-        ["BTN_RESET_SVC", "Reset Service"],
-        ["BTN_SETTINGS", "Ustawienia"]
+        ["BTN_PAGE", "Next page"],
+        ["BTN_PREV", "Previous page"],
+        ["BTN_SETTINGS", "Settings"]
       ]
     }
   ],

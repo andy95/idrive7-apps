@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const mgu = require('./kit/mgu');
 const G = require('./kit/gauges');
-const { withAlpha, mix } = require('./kit/canvas');
+const { withAlpha } = require('./kit/canvas');
 const Car = require('./kit/car');
 const { ReadOnlyDiag } = require('./kit/readonly-diag');
 const { split } = require('./kit/sgbd');
@@ -71,9 +71,14 @@ mgu.run({
         const car = new Car(ctx, ['rpm', 'speed', 'temps', 'torque', 'accel']);
         car.setRedline(6500);
 
-        // Read-only diagnostic link for DME (0x12) and SME (0x07)
-        const diag = new ReadOnlyDiag(ctx.signals, log);
-        diag.init().catch((e) => log.warn('ReadOnlyDiag init: ' + e));
+        // Read-only diagnostic link for DME (0x12)
+        let diag = null;
+        try {
+            diag = new ReadOnlyDiag(ctx.signals, log);
+            diag.init().catch((e) => log.warn('ReadOnlyDiag init: ' + e));
+        } catch (e) {
+            log.warn('ReadOnlyDiag creation error: ' + e);
+        }
 
         /* ---------------- State & Persistence ---------------- */
         const STATE_FILE = path.join(ctx.dataDir, 'service_state.json');
@@ -97,7 +102,7 @@ mgu.run({
         function saveServiceState() {
             try {
                 fs.mkdirSync(ctx.dataDir, { recursive: true });
-                const tmp = STATE_FILE + '.tmp';
+                const tmp = STATE_FILE + '.' + process.pid + '.tmp';
                 fs.writeFileSync(tmp, JSON.stringify(serviceState, null, 2), 'utf8');
                 fs.renameSync(tmp, STATE_FILE);
             } catch (e) {
@@ -116,20 +121,17 @@ mgu.run({
         function updateBarButtons() {
             if (activeTab === 0) {
                 ui.text('BTN_ACTION', 'Reset Peak');
-                ui.text('BTN_RESET_SVC', 'Wskaznik 100-200');
             } else if (activeTab === 1) {
                 ui.text('BTN_ACTION', 'Kasuj Cooldown');
-                ui.text('BTN_RESET_SVC', 'Tryb Warmup');
             } else if (activeTab === 2) {
-                ui.text('BTN_ACTION', 'Zmien CBS (1/2/3)');
                 const isArmed = Date.now() < serviceConfirmUntil;
                 const it = serviceState.intervals[selectedServiceIdx];
-                ui.text('BTN_RESET_SVC', isArmed ? 'POTWIERDZ RESET!' : 'Resetuj: ' + (it ? it.id : ''));
+                ui.text('BTN_ACTION', isArmed ? 'POTWIERDZ RESET!' : 'Resetuj: ' + (it ? it.id : 'CBS'));
             }
         }
 
-        const flipNext = () => { activeTab = (activeTab + 1) % 3; serviceConfirmUntil = 0; updateBarButtons(); };
-        const flipPrev = () => { activeTab = (activeTab + 2) % 3; serviceConfirmUntil = 0; updateBarButtons(); };
+        const flipNext = () => { activeTab = (activeTab + 1) % 3; serviceConfirmUntil = 0; updateBarButtons(); render(); };
+        const flipPrev = () => { activeTab = (activeTab + 2) % 3; serviceConfirmUntil = 0; updateBarButtons(); render(); };
 
         ui.onClick('BTN_PAGE', flipNext);
         ui.onClick('BTN_PREV', flipPrev);
@@ -138,6 +140,26 @@ mgu.run({
                 activeTab = i;
                 serviceConfirmUntil = 0;
                 updateBarButtons();
+                render();
+            }
+        });
+
+        // Touch support on screen
+        ctx.onTap((x, y) => {
+            if (activeTab === 2) {
+                // Tapping on service item rows to select them
+                const itemY0 = 46 + 86;
+                const itemH = 104;
+                for (let i = 0; i < serviceState.intervals.length; i++) {
+                    const iy = itemY0 + i * (itemH + 12);
+                    if (x >= 36 && x <= 1040 && y >= iy && y <= iy + itemH) {
+                        selectedServiceIdx = i;
+                        serviceConfirmUntil = 0;
+                        updateBarButtons();
+                        render();
+                        break;
+                    }
+                }
             }
         });
 
@@ -145,21 +167,13 @@ mgu.run({
         ui.onClick('BTN_ACTION', () => {
             if (activeTab === 0) {
                 resetPeaks();
+                render();
             } else if (activeTab === 1) {
                 cooldownRemaining = 0;
+                render();
             } else if (activeTab === 2) {
-                selectedServiceIdx = (selectedServiceIdx + 1) % serviceState.intervals.length;
-                serviceConfirmUntil = 0;
-                updateBarButtons();
-            }
-        });
-
-        // Service Reset button handler with 5-second double confirmation
-        ui.onClick('BTN_RESET_SVC', () => {
-            if (activeTab === 2) {
                 const now = Date.now();
                 if (now < serviceConfirmUntil) {
-                    // Executing reset
                     const it = serviceState.intervals[selectedServiceIdx];
                     if (it) {
                         it.currentKm = 0;
@@ -168,12 +182,10 @@ mgu.run({
                     }
                     serviceConfirmUntil = 0;
                 } else {
-                    // Armed for 5 seconds
                     serviceConfirmUntil = now + 5000;
                 }
                 updateBarButtons();
-            } else if (activeTab === 0) {
-                resetPeaks();
+                render();
             }
         });
 
@@ -200,51 +212,37 @@ mgu.run({
             log.info('Peaks reset');
         }
 
-        // DME DIDs:
-        // 0x4205: IPLAD (u16, k: 0.078125 hPa)
-        // 0x4AB0: S_LADEDRUCK (u16, k: 0.0390625 hPa)
-        // 0x580F: ITANS (u8, k: 0.75, o: -48.0 °C)
-        // 0x59FA: I_ZUENDWINKEL (s8, k: 0.75 °CA)
-        // 0x4A49: IZWZ1 (s16, k: 0.1 °CA)
-        // 0x4A4A: IZWZ2 (s16, k: 0.1 °CA)
-        // 0x4A4C: IZWZ3 (s16, k: 0.1 °CA)
-        // 0x4A4D: IZWZ4 (s16, k: 0.1 °CA)
         const DME_DIDS = [0x4205, 0x4AB0, 0x580F, 0x59FA, 0x4A49, 0x4A4A, 0x4A4C, 0x4A4D];
         const DME_LENS = { 0x4205: 2, 0x4AB0: 2, 0x580F: 1, 0x59FA: 1, 0x4A49: 2, 0x4A4A: 2, 0x4A4C: 2, 0x4A4D: 2 };
 
         let diagBusy = false;
         async function pollDmeDiag() {
-            if (diagBusy || !diag.ready) return;
+            if (diagBusy || !diag || !diag.ready) return;
             diagBusy = true;
             try {
                 const reply = await diag.readMany(0x12, DME_DIDS, 1000);
                 if (reply && reply[0] === 0x62) {
                     const parts = split(reply, DME_LENS);
                     if (parts) {
-                        // 0x4205: actual boost
                         if (parts[0x4205]) {
                             const raw = (parts[0x4205][3] << 8) | parts[0x4205][4];
                             const hpa = raw * 0.078125;
                             liveDiag.boostActual = Math.max(0, (hpa - 1013) / 1000);
                         }
-                        // 0x4AB0: target boost
                         if (parts[0x4AB0]) {
                             const raw = (parts[0x4AB0][3] << 8) | parts[0x4AB0][4];
                             const hpa = raw * 0.0390625;
                             liveDiag.boostTarget = Math.max(0, (hpa - 1013) / 1000);
                         }
-                        // 0x580F: IAT
                         if (parts[0x580F]) {
                             const raw = parts[0x580F][3];
                             liveDiag.iat = raw * 0.75 - 48.0;
                         }
-                        // 0x59FA: Base ignition timing
                         if (parts[0x59FA]) {
                             let raw = parts[0x59FA][3];
                             if (raw >= 128) raw -= 256;
                             liveDiag.baseTiming = raw * 0.75;
                         }
-                        // Cylinders 1-4
                         [0x4A49, 0x4A4A, 0x4A4C, 0x4A4D].forEach((did, idx) => {
                             if (parts[did]) {
                                 let raw = (parts[did][3] << 8) | parts[did][4];
@@ -257,15 +255,14 @@ mgu.run({
                     }
                 }
             } catch (err) {
-                // Diag busy or failed, continue cleanly
+                // Diag error caught cleanly
             } finally {
                 diagBusy = false;
             }
         }
 
-        // Periodically poll DME diagnostics when on Tab 0 (or every 250ms)
         setInterval(() => {
-            if (activeTab === 0 && diag.ready) {
+            if (activeTab === 0 && diag && diag.ready) {
                 pollDmeDiag();
             }
         }, 250);
@@ -275,7 +272,6 @@ mgu.run({
         let lastCooldownTick = Date.now();
 
         /* ---------------- Synthetic / Demo Driving Generator ---------------- */
-        // Used in emulator on PC or when demo mode is active
         let demoPhase = 0;
         let demoOdoAccumulator = 0;
 
@@ -291,7 +287,6 @@ mgu.run({
                 liveDiag.baseTiming = 11.5 + 2 * Math.cos(demoPhase * 2);
                 liveDiag.cylCorr[0] = -0.4;
                 liveDiag.cylCorr[1] = -0.8;
-                // Cyl 3 simulated knock retard under PB95 to demonstrate alert
                 liveDiag.cylCorr[2] = (Math.sin(demoPhase * 2.5) > 0.6) ? -3.4 : -1.2;
                 liveDiag.cylCorr[3] = -0.2;
             } else {
@@ -306,10 +301,8 @@ mgu.run({
                 liveDiag.cylCorr[3] = 0.0;
             }
 
-            // Simulated battery SoC (drifts slowly between 75% and 22% to showcase BMS Derating)
             liveDiag.soc = 50 + 28 * Math.sin(demoPhase * 0.15);
 
-            // Virtual odometer progress for demo (adds km to showcase Service Tracker)
             demoOdoAccumulator += (d.speed || 60) * (dt / 3600);
             if (demoOdoAccumulator >= 0.1) {
                 const addKm = 0.1;
@@ -340,7 +333,6 @@ mgu.run({
             }
         }
 
-        // Watch SOME/IP odometer signal
         ctx.signals.watch('de.bmw.infotainment.KombiIF', '1', {
             statusRangeTankStatus: (v) => {
                 if (v && G.isNum(v.mileageKilometre) && v.mileageKilometre < 16777215) {
@@ -350,7 +342,6 @@ mgu.run({
             }
         }, log).catch((e) => log.warn('KombiIF watch: ' + e));
 
-        // Watch battery storage info
         ctx.signals.watch('de.bmw.infotainment.lsc.LSCDataSink', '1', {
             statusHighVoltageStorage: (v) => {
                 if (v && G.isNum(v.actualValueStateOfCharge)) {
@@ -359,17 +350,8 @@ mgu.run({
             }
         }, log).catch((e) => log.warn('LSCDataSink watch: ' + e));
 
-        // Watch battery distribution
-        ctx.signals.watch('de.bmw.infotainment.KombiIF', '1', {
-            statusDisplayElectricalPowerDistribution: (v) => {
-                if (v && G.isNum(v.displayRepartitionDriveElectricPower)) {
-                    // Distribution factor
-                }
-            }
-        }, log).catch((e) => log.warn('KombiIF distribution: ' + e));
-
-        /* ---------------- Main 60 FPS Render Loop ---------------- */
-        ctx.loop('MAIN', 60, () => {
+        /* ---------------- Main Render Function ---------------- */
+        async function render() {
             const t = ctx.theme();
             const cv = ctx.canvas(W, H).clear(t.bg);
             const d = car.data();
@@ -377,21 +359,17 @@ mgu.run({
             const dt = Math.min(0.1, Math.max(0.001, (now - lastCooldownTick) / 1000));
             lastCooldownTick = now;
 
-            // In demo / emulator mode, update simulated state
-            const isDemo = (!diag.ready) || settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && d.demo);
+            const isDemo = (!diag || !diag.ready) || settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && d.demo);
             if (isDemo) {
                 updateDemoState(d, dt);
             }
 
-            // 1. Calculate B48 ICE Performance
             const rpm = G.isNum(d.rpm) ? d.rpm : 0;
             const iceTorque = G.isNum(d.torque) && d.torque > 0 ? d.torque : 0;
             const iceKw = (iceTorque * rpm) / 9549;
             const iceHp = iceKw * 1.35962;
 
-            // 2. Calculate EME Electric Performance & BMS Derating
             const soc = G.isNum(liveDiag.soc) ? liveDiag.soc : 60;
-            // BMS derates below 30% SoC down to ~70% at 15% SoC
             let derateRatio = 1.0;
             if (soc < 30) {
                 derateRatio = G.clamp(0.45 + (soc / 30) * 0.55, 0.45, 1.0);
@@ -403,15 +381,12 @@ mgu.run({
             const lostHp = SPEC.evMaxHp - evMaxHp;
             const lostNm = SPEC.evMaxNm - evMaxNm;
 
-            // Electric load follows throttle/acceleration
             const accelPct = G.clamp((rpm / 4500) * (iceTorque / 350 || 0.5), 0, 1);
             const evHp = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxHp * accelPct) : 0;
             const evTorque = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxNm * accelPct) : 0;
 
-            // 3. System Power (ICE + EME)
             const systemHp = Math.round(iceHp + evHp);
 
-            // 4. Update WOT & Peaks
             if (liveDiag.boostActual > 1.0 || (iceTorque > 350 && rpm > 3200)) {
                 liveDiag.wot = true;
                 liveDiag.peakBoost = Math.max(liveDiag.peakBoost, liveDiag.boostActual);
@@ -421,7 +396,6 @@ mgu.run({
                 }
             }
 
-            // 5. Turbo Cooldown Timer Logic
             const oilTemp = G.isNum(d.oil) ? d.oil : 88;
             const coolantTemp = G.isNum(d.coolant) ? d.coolant : 92;
             const isHardDriving = (liveDiag.boostActual > 1.0) || (rpm > 3900 && iceTorque > 300) || (oilTemp > 102);
@@ -429,29 +403,24 @@ mgu.run({
             if (isHardDriving) {
                 cooldownRemaining = settings.get('cooldownSec') || 90;
             } else if (cooldownRemaining > 0) {
-                // Cools down when gentle (rpm < 2200 and low boost) or idling
                 const isGentle = (rpm < 2200 && liveDiag.boostActual < 0.25);
                 if (isGentle) {
                     cooldownRemaining = Math.max(0, cooldownRemaining - dt);
                 }
             }
 
-            // 100-200 READY Assessment
             const oilOk = (oilTemp >= 85 && oilTemp <= 108);
             const iatOk = (liveDiag.iat < 45);
             const bmsOk = (derateRatio >= 0.98);
             const ready100_200 = oilOk && iatOk && bmsOk;
 
-            // Badges in header
             const badges = [];
             if (isDemo) badges.push({ text: 'DEMO', color: 'accent' });
             if (cooldownRemaining > 0) badges.push({ text: 'COOLDOWN ' + Math.ceil(cooldownRemaining) + 's', color: 'warn' });
             if (ready100_200) badges.push({ text: '420 KM READY', color: GO });
 
-            // Draw full-screen frame with 3 tabs
             G.frame(cv, t, TABS, activeTab, badges);
 
-            // Render current active tab content
             if (activeTab === 0) {
                 renderTab1_XtraBoostGuard(cv, t, {
                     rpm, iceHp, iceTorque, evHp, evTorque, evMaxHp, evMaxNm,
@@ -465,7 +434,17 @@ mgu.run({
             } else if (activeTab === 2) {
                 renderTab3_ServiceTracker(cv, t);
             }
-        });
+
+            // CRITICAL: Hand drawn canvas to display/HMI so it renders on screen!
+            return ui.image('MAIN_GFX', cv);
+        }
+
+        // Paced at display vsync (60 fps) with GPU renderer; 6 fps software fallback
+        ctx.loop('MAIN', 6, render);
+
+        // Render first frame immediately at startup
+        updateBarButtons();
+        render().then(() => log.info('first frame rendered successfully')).catch((e) => log.error('first render error', e));
 
         /* =========================================================================
          * TAB 1: XTRABOOST GUARD (Dual Power Split, BMS Detector, 100-200, Fuel)
@@ -475,10 +454,8 @@ mgu.run({
             const topY = 46;
             const h = 466;
 
-            // ---------------- Left Column: Dual Power Split ----------------
             G.panel(cv, t, 16, topY, colW, h, 'MOC SILNIKOW (DUAL POWER SPLIT)');
 
-            // B48 ICE section
             cv.text('SILNIK B48 (SPALINOWY - STAGE 1)', 36, topY + 68, 20, t.text, { font: 'bold' });
             G.bar(cv, t, 36, topY + 76, colW - 40, 60, {
                 label: 'MOC B48',
@@ -504,7 +481,6 @@ mgu.run({
                 zones: [{ from: 430, to: 500, color: CRIT }]
             });
 
-            // EME Electric Motor section
             cv.fillRect(36, topY + 236, colW - 40, 1, withAlpha('#ffffff', 0.12));
             cv.text('SILNIK ELEKTRYCZNY (EME - XTRABOOST)', 36, topY + 264, 20, p.derateRatio < 0.98 ? WARN : M_CYAN, { font: 'bold' });
 
@@ -530,7 +506,6 @@ mgu.run({
                 peak: p.evMaxNm
             });
 
-            // BMS Derating Alert Banner
             if (p.derateRatio < 0.98) {
                 cv.roundRect(36, topY + 418, colW - 40, 42, 6, withAlpha(WARN, 0.22));
                 cv.strokeRoundRect(36, topY + 418, colW - 40, 42, 6, 1.5, WARN);
@@ -543,18 +518,15 @@ mgu.run({
                     36 + (colW - 40) / 2, topY + 444, 18, GO, { align: 'center', font: 'bold' });
             }
 
-            // ---------------- Middle Column: System Power & 100-200 Ready ----------------
             const midX = 534;
             const midW = 532;
             G.panel(cv, t, midX, topY, midW, h, 'MOC SYSTEMOWA & 100-200 READY');
 
-            // System Power Display
             cv.text('MOC SYSTEMOWA (HYBRYDA B48 + EME)', midX + midW / 2, topY + 68, 20, t.dim, { align: 'center', font: 'bold', spacing: 1.5 });
             const pwrStr = String(p.systemHp);
             const pw = cv.text(pwrStr, midX + midW / 2 - 32, topY + 145, 84, p.systemHp >= 400 ? GO : t.text, { align: 'center', font: 'num' });
             cv.text('KM', midX + midW / 2 + pw / 2 + 10, topY + 138, 32, t.dim, { font: 'bold' });
 
-            // System Power Bar
             G.bar(cv, t, midX + 30, topY + 158, midW - 60, 48, {
                 label: '',
                 head: false,
@@ -565,14 +537,12 @@ mgu.run({
                 zones: [{ from: 410, to: 450, color: GO }]
             });
 
-            // 100-200 Readiness Card
             cv.fillRect(midX + 30, topY + 224, midW - 60, 1, withAlpha('#ffffff', 0.12));
             cv.text('STATUS GOTOWOSCI DO POMIARU 100-200 KM/H', midX + midW / 2, topY + 252, 20, t.text, { align: 'center', font: 'bold' });
 
             const rCardY = topY + 268;
             const rCardH = 188;
             if (p.ready100_200) {
-                // Green Ready
                 cv.roundRect(midX + 30, rCardY, midW - 60, rCardH, 10, withAlpha(GO, 0.22));
                 cv.strokeRoundRect(midX + 30, rCardY, midW - 60, rCardH, 10, 2, GO);
                 cv.text('GOTOWY - 420 KM', midX + midW / 2, rCardY + 48, 38, GO, { align: 'center', font: 'bold', spacing: 2 });
@@ -583,7 +553,6 @@ mgu.run({
                 cv.text('✓ Temp. dolotu (IAT): ' + liveDiag.iat.toFixed(0) + '°C (< 45°C)', midX + 60, rCardY + 154, 20, t.text);
                 cv.text('✓ Bateria XtraBoost: 100% mocy elektryka', midX + 60, rCardY + 178, 20, t.text);
             } else {
-                // Not Ready
                 const cardCol = (!p.oilOk && p.oilTemp < 60) ? CRIT : WARN;
                 cv.roundRect(midX + 30, rCardY, midW - 60, rCardH, 10, withAlpha(cardCol, 0.16));
                 cv.strokeRoundRect(midX + 30, rCardY, midW - 60, rCardH, 10, 2, cardCol);
@@ -605,12 +574,10 @@ mgu.run({
                 }
             }
 
-            // ---------------- Right Column: Fuel & Knock Monitor ----------------
             const rightX = 1084;
             const rightW = 500;
             G.panel(cv, t, rightX, topY, rightW, h, 'MONITOR PALIWA & ZAPLONU (0x12 DME)');
 
-            // Boost Pressure Actual vs Target
             G.bar(cv, t, rightX + 24, topY + 68, rightW - 40, 60, {
                 label: 'DOLADOWANIE (CEL ' + SPEC.targetBoostBar.toFixed(1) + ' BAR)',
                 unit: 'bar',
@@ -623,7 +590,6 @@ mgu.run({
                 zones: [{ from: 1.45, to: 1.65, color: GO }, { from: 1.65, to: 2.0, color: CRIT }]
             });
 
-            // IAT Readout
             G.bar(cv, t, rightX + 24, topY + 146, rightW - 40, 60, {
                 label: 'TEMP. W DOLOCIE (IAT)',
                 unit: '°C',
@@ -636,14 +602,12 @@ mgu.run({
                 zones: [{ from: 45, to: 60, color: CRIT }]
             });
 
-            // Ignition Timing & Cylinder Corrections
             cv.fillRect(rightX + 24, topY + 226, rightW - 40, 1, withAlpha('#ffffff', 0.12));
             cv.text('KAT ZAPLONU: ' + liveDiag.baseTiming.toFixed(1) + '°CA (CYLINDRY 1-4 KOREKTY)', rightX + 24, topY + 254, 19, t.text, { font: 'bold' });
 
             const thresh = settings.get('knockThreshold') || -3.0;
             let knockDetected = false;
 
-            // 4 Cylinder Knock Correction Boxes
             const boxW = (rightW - 40 - 24) / 4;
             for (let c = 0; c < 4; c++) {
                 const bx = rightX + 24 + c * (boxW + 8);
@@ -661,7 +625,6 @@ mgu.run({
                 cv.text('Peak ' + (pCorr > 0 ? '+' : '') + pCorr.toFixed(1) + '°', bx + boxW / 2, by + 66, 15, bad ? CRIT : t.dim, { align: 'center' });
             }
 
-            // Knock / Fuel Quality Verdict Banner
             const verdictY = topY + 360;
             if (knockDetected) {
                 cv.roundRect(rightX + 24, verdictY, rightW - 40, 90, 8, withAlpha(CRIT, 0.22));
@@ -686,10 +649,8 @@ mgu.run({
             const topY = 46;
             const h = 466;
 
-            // ---------------- Left Column: Warmup & Cold-Start Guard ----------------
             G.panel(cv, t, 16, topY, colW, h, 'ROZGRZEWANIE SILNIKA B48 & HYBRID COLD-START GUARD');
 
-            // Oil & Coolant Gauges
             const gaugeW = (colW - 60) / 2;
             G.panel(cv, t, 36, topY + 58, gaugeW, 134, 'TEMPERATURA OLEJU');
             const oilCol = p.oilTemp < 50 ? M_CYAN : p.oilTemp < 80 ? WARN : p.oilTemp > 108 ? CRIT : GO;
@@ -702,7 +663,6 @@ mgu.run({
             cv.text(p.coolantTemp.toFixed(0) + ' °C', 36 + gaugeW + 20 + gaugeW / 2, topY + 130, 48, cCol, { align: 'center', font: 'num' });
             cv.text(p.coolantTemp >= 80 ? 'ROBOCZA' : 'ROZGRZEWANIE', 36 + gaugeW + 20 + gaugeW / 2, topY + 166, 20, cCol, { align: 'center', font: 'bold' });
 
-            // Dynamic Limits calculation
             let modeTitle, modeCol, safeRpm, safeBoost;
             if (p.oilTemp < 50) {
                 modeTitle = 'TRYB ZIMNY (B48 COLD GUARD)';
@@ -722,7 +682,6 @@ mgu.run({
                 safeBoost = 1.50;
             }
 
-            // Mode Card
             const cardY = topY + 210;
             cv.roundRect(36, cardY, colW - 40, 110, 8, withAlpha(modeCol, 0.18));
             cv.strokeRoundRect(36, cardY, colW - 40, 110, 8, 2, modeCol);
@@ -731,7 +690,6 @@ mgu.run({
             cv.text('BEZPIECZNY PUAP OBROTOW: ' + safeRpm + ' RPM', 56, cardY + 68, 22, t.text, { font: 'bold' });
             cv.text('MAX DOZWOLONE DOLADOWANIE: ' + safeBoost.toFixed(1) + ' bar', 56, cardY + 96, 22, t.text, { font: 'bold' });
 
-            // Visual Throttle Alert when Cold Engine Over-revved
             const overrev = (p.oilTemp < 50 && p.rpm > 2500);
             if (overrev) {
                 cv.roundRect(36, topY + 338, colW - 40, 110, 8, withAlpha(CRIT, 0.3));
@@ -740,7 +698,6 @@ mgu.run({
                 cv.text('B48 uruchomiony w hybrydzie przy zimnym oleju. Zwolnij obroty ponizej 2500 RPM!',
                     36 + (colW - 40) / 2, topY + 414, 20, t.text, { align: 'center' });
             } else {
-                // RPM Bar
                 G.bar(cv, t, 36, topY + 344, colW - 40, 60, {
                     label: 'OBROTY SILNIKA B48',
                     unit: 'RPM',
@@ -754,7 +711,6 @@ mgu.run({
                 cv.text('Hybryda 530e uruchamia B48 nagle przy wyprzedzaniu - kontroluj limit!', 56, topY + 434, 18, t.dim);
             }
 
-            // ---------------- Right Column: Turbo Cooldown & PHEV Warning ----------------
             const rightX = 820;
             G.panel(cv, t, rightX, topY, colW, h, 'STRAZNIK CHLODZENIA TURBINY (PHEV S/S GUARD)');
 
@@ -762,7 +718,6 @@ mgu.run({
             const coolH = 390;
 
             if (coolActive) {
-                // Active Cooldown Warning Panel
                 cv.roundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, withAlpha(CRIT, 0.22));
                 cv.strokeRoundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, 2.5, CRIT);
 
@@ -770,7 +725,6 @@ mgu.run({
                 cv.text('Wlacz tryb SPORT lub przesun dzwignie w S,', rightX + colW / 2, topY + 158, 26, t.text, { align: 'center', font: 'bold' });
                 cv.text('aby hybryda nie wylaczyla obiegu oleju na postoju!', rightX + colW / 2, topY + 194, 26, WARN, { align: 'center', font: 'bold' });
 
-                // Big Countdown timer
                 cv.fillRect(rightX + 60, topY + 224, colW - 120, 1, withAlpha(CRIT, 0.3));
                 cv.text('POZOSTALO CHLODZENIA TURBINY', rightX + colW / 2, topY + 258, 22, t.dim, { align: 'center', font: 'bold', spacing: 1.5 });
 
@@ -778,14 +732,12 @@ mgu.run({
                 const cdw = cv.text(cdStr, rightX + colW / 2 - 20, topY + 346, 96, CRIT, { align: 'center', font: 'num' });
                 cv.text('sekund', rightX + colW / 2 + cdw / 2 + 15, topY + 338, 28, t.dim);
 
-                // Cooldown progress bar
                 const totalCd = settings.get('cooldownSec') || 90;
                 const progress = G.clamp(1.0 - (p.cooldownRemaining / totalCd), 0, 1);
                 cv.fillRect(rightX + 60, topY + 380, colW - 120, 14, withAlpha('#ffffff', 0.15));
                 cv.fillRect(rightX + 60, topY + 380, Math.round((colW - 120) * progress), 14, GO);
                 cv.text('Postoj z pracujacym silnikiem lub spokojna jazda', rightX + colW / 2, topY + 424, 19, t.dim, { align: 'center' });
             } else {
-                // Cooldown completed / idle
                 cv.roundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, withAlpha(GO, 0.15));
                 cv.strokeRoundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, 1.5, withAlpha(GO, 0.6));
 
@@ -809,7 +761,6 @@ mgu.run({
             const topY = 46;
             const h = 466;
 
-            // ---------------- Left / Center: Service Intervals ----------------
             const leftW = 1040;
             G.panel(cv, t, 16, topY, leftW, h, 'INTELIGENTNY LICZNIK SERWISOWY (B48 OPERATING KM)');
 
@@ -832,21 +783,17 @@ mgu.run({
                 if (wearPct >= 90) pCol = CRIT;
                 else if (wearPct >= 70) pCol = WARN;
 
-                // Item Container Box
                 cv.roundRect(36, iy, leftW - 40, itemH, 8, withAlpha(isSelected ? BLUE : '#ffffff', isSelected ? 0.20 : 0.05));
                 cv.strokeRoundRect(36, iy, leftW - 40, itemH, 8, isSelected ? 2 : 1, isSelected ? (isArmed ? CRIT : BLUE) : withAlpha('#ffffff', 0.15));
 
-                // Title & Details
                 const titleStr = it.name;
-                cv.text(titleStr, 56, iy + 30, 24, isSelected ? t.text : t.text, { font: 'bold' });
+                cv.text(titleStr, 56, iy + 30, 24, t.text, { font: 'bold' });
                 cv.text(it.spec || '', 56, iy + 52, 17, t.dim);
 
-                // Numbers right-aligned
                 const numStr = current.toFixed(0) + ' / ' + limit + ' km B48';
                 cv.text(numStr, leftW - 24, iy + 30, 24, t.text, { align: 'right', font: 'num' });
                 cv.text('Pozostalo: ' + remaining.toFixed(0) + ' km (' + wearPct + '% zuzycia)', leftW - 24, iy + 52, 18, pCol, { align: 'right', font: 'bold' });
 
-                // Progress Bar
                 const barX = 56;
                 const barY = iy + 68;
                 const barW = leftW - 40 - 40;
@@ -857,25 +804,22 @@ mgu.run({
                     cv.roundRect(barX, barY, fillW, barH, 4, pCol);
                 }
 
-                // Selection marker
                 if (isSelected) {
                     cv.text('►', 40, iy + 42, 20, isArmed ? CRIT : BLUE);
                 }
             });
 
-            // Action / Reset instructions
             const noteY = topY + 444;
             const isArmed = Date.now() < serviceConfirmUntil;
             if (isArmed) {
                 const it = serviceState.intervals[selectedServiceIdx];
-                cv.text('POTWIERDZ RESET DLA: ' + (it ? it.name : '') + ' (KLIKNIJ PONOWNIE W CIAGU 5s)',
+                cv.text('POTWIERDZ RESET DLA: ' + (it ? it.name : '') + ' (KLIKNIJ DOLNY PRZYCISK W CIAGU 5s)',
                     leftW / 2, noteY, 20, CRIT, { align: 'center', font: 'bold' });
             } else {
-                cv.text('Wybierz pozycje przyciskiem "Zmien CBS" lub dotykiem | Podwojne klikniecie chroni przed przypadkowym resetem',
+                cv.text('Wskaz pozycje dotykiem na ekranie | Dolny przycisk: Reset z podwojnym potwierdzeniem',
                     leftW / 2, noteY, 18, t.dim, { align: 'center' });
             }
 
-            // ---------------- Right Column: Hybrid Trip & Mileage Split ----------------
             const rightX = 1076;
             const rightW = 508;
             G.panel(cv, t, rightX, topY, rightW, h, 'BILANS PRZEBIEGU HYBRYDY (PHEV)');
@@ -886,33 +830,27 @@ mgu.run({
             const evPct = totalTracked > 0 ? Math.round((totalEv / totalTracked) * 100) : 0;
             const totalOdo = (serviceState.baseOdo || 113000) + totalTracked;
 
-            // Total Odometer Display
             cv.text('CALKOWITY PRZEBIEG AUTA (ODOMETER)', rightX + 24, topY + 70, 19, t.dim, { font: 'bold', spacing: 1.5 });
             cv.text(totalOdo.toFixed(0) + ' km', rightX + 24, topY + 116, 42, t.text, { font: 'num' });
 
             cv.fillRect(rightX + 24, topY + 138, rightW - 48, 1, withAlpha('#ffffff', 0.12));
 
-            // ICE vs EV Statistics Tiles
             cv.text('ROZDZIAL PRZEBIEGU W TYM CYKLU:', rightX + 24, topY + 168, 19, t.dim, { font: 'bold', spacing: 1.5 });
 
-            // B48 ICE Tile
             cv.roundRect(rightX + 24, topY + 184, rightW - 48, 64, 8, withAlpha(BLUE, 0.15));
             cv.strokeRoundRect(rightX + 24, topY + 184, rightW - 48, 64, 8, 1, withAlpha(BLUE, 0.6));
             cv.text('PRACA SILNIKA B48 (RPM > 0):', rightX + 44, topY + 212, 19, t.text, { font: 'bold' });
             cv.text(totalIce.toFixed(1) + ' km', rightX + rightW - 48, topY + 224, 26, BLUE, { align: 'right', font: 'num' });
 
-            // EV Tile
             cv.roundRect(rightX + 24, topY + 260, rightW - 48, 64, 8, withAlpha(GO, 0.15));
             cv.strokeRoundRect(rightX + 24, topY + 260, rightW - 48, 64, 8, 1, withAlpha(GO, 0.6));
             cv.text('JAZDA BEZEMISYJNA EV (RPM == 0):', rightX + 44, topY + 288, 19, t.text, { font: 'bold' });
             cv.text(totalEv.toFixed(1) + ' km', rightX + rightW - 48, topY + 300, 26, GO, { align: 'right', font: 'num' });
 
-            // EV Share % Bar
             cv.text('UDZIAL JAZDY NA PRADZIE: ' + evPct + '%', rightX + 24, topY + 358, 20, GO, { font: 'bold' });
             cv.roundRect(rightX + 24, topY + 372, rightW - 48, 18, 4, withAlpha('#ffffff', 0.15));
             cv.roundRect(rightX + 24, topY + 372, Math.round((rightW - 48) * (evPct / 100)), 18, 4, GO);
 
-            // Explanatory badge
             cv.text('Olej, filtr i swiece zuzywaja sie tylko wtedy,', rightX + 24, topY + 420, 17, t.dim);
             cv.text('gdy silnik B48 fizycznie pracuje. Prad nie zuzywa B48!', rightX + 24, topY + 444, 17, GO, { font: 'bold' });
         }
