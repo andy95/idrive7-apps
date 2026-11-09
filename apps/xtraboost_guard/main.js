@@ -1,0 +1,920 @@
+'use strict';
+/**
+ * XtraBoost Guard - Custom MGU App for BMW G30 530e PHEV (Stage 1 B48 420 KM).
+ *
+ * Zakładka 1: "XtraBoost Guard" (Dual Power Split 420 KM, Detektor BMS, 100-200 Ready, Monitor Paliwa PB95 vs PB98)
+ * Zakładka 2: "Warmup & Turbo" (Ochrona Zimnego B48, Dynamiczny Limit RPM/Boost, Strażnik Cooldown Turbiny)
+ * Zakładka 3: "Service Tracker" (Inteligentny Licznik Przebiegu B48 vs EV, Olej Millers, Filtr, Świece NGK)
+ */
+const fs = require('fs');
+const path = require('path');
+const mgu = require('./kit/mgu');
+const G = require('./kit/gauges');
+const { withAlpha, mix } = require('./kit/canvas');
+const Car = require('./kit/car');
+const { ReadOnlyDiag } = require('./kit/readonly-diag');
+const { split } = require('./kit/sgbd');
+
+const W = 1600, H = 520;
+const GO = '#2fd27a';
+const WARN = '#f59e0b';
+const CRIT = '#ef4444';
+const BLUE = '#0066b1';
+const M_CYAN = '#00a3e0';
+
+// Nominal performance specs for G30 530e Stage 1
+const SPEC = {
+    iceMaxHp: 311,
+    iceMaxNm: 440,
+    evMaxHp: 109,
+    evMaxNm: 265,
+    systemMaxHp: 420,
+    targetBoostBar: 1.50
+};
+
+// Seed data for BMW G30 530e Service Tracker
+const DEFAULT_SERVICE_STATE = {
+    baseOdo: 113000,
+    lastOdo: 113000,
+    totalIceKm: 0,
+    totalEvKm: 0,
+    intervals: [
+        {
+            id: 'oil',
+            name: 'Olej silnikowy (Millers 5W-40)',
+            limitKm: 10500,
+            currentKm: 0,
+            spec: 'Millers EE Performance 5W-40'
+        },
+        {
+            id: 'air_filter',
+            name: 'Filtr powietrza',
+            limitKm: 21000,
+            currentKm: 2800,
+            spec: 'Wkladka OE / sportowa (start: 2800 km)'
+        },
+        {
+            id: 'spark_plugs',
+            name: 'Swiece zaplonowe NGK',
+            limitKm: 35000,
+            currentKm: 0,
+            spec: 'NGK Iridium (start: 0 km)'
+        }
+    ]
+};
+
+mgu.run({
+    async start(ctx) {
+        const { ui, settings, log } = ctx;
+
+        // Common driving signals from SOME/IP
+        const car = new Car(ctx, ['rpm', 'speed', 'temps', 'torque', 'accel']);
+        car.setRedline(6500);
+
+        // Read-only diagnostic link for DME (0x12) and SME (0x07)
+        const diag = new ReadOnlyDiag(ctx.signals, log);
+        diag.init().catch((e) => log.warn('ReadOnlyDiag init: ' + e));
+
+        /* ---------------- State & Persistence ---------------- */
+        const STATE_FILE = path.join(ctx.dataDir, 'service_state.json');
+        let serviceState = null;
+
+        function loadServiceState() {
+            try {
+                fs.mkdirSync(ctx.dataDir, { recursive: true });
+                if (fs.existsSync(STATE_FILE)) {
+                    serviceState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+                }
+            } catch (e) {
+                log.warn('loadServiceState error: ' + e.message);
+            }
+            if (!serviceState || !Array.isArray(serviceState.intervals)) {
+                serviceState = JSON.parse(JSON.stringify(DEFAULT_SERVICE_STATE));
+                saveServiceState();
+            }
+        }
+
+        function saveServiceState() {
+            try {
+                fs.mkdirSync(ctx.dataDir, { recursive: true });
+                const tmp = STATE_FILE + '.tmp';
+                fs.writeFileSync(tmp, JSON.stringify(serviceState, null, 2), 'utf8');
+                fs.renameSync(tmp, STATE_FILE);
+            } catch (e) {
+                log.warn('saveServiceState error: ' + e.message);
+            }
+        }
+
+        loadServiceState();
+
+        /* ---------------- App Navigation & Tabs ---------------- */
+        const TABS = ['XTRABOOST GUARD', 'WARMUP & TURBO', 'SERVICE TRACKER'];
+        let activeTab = 0;
+        let selectedServiceIdx = 0;
+        let serviceConfirmUntil = 0;
+
+        function updateBarButtons() {
+            if (activeTab === 0) {
+                ui.text('BTN_ACTION', 'Reset Peak');
+                ui.text('BTN_RESET_SVC', 'Wskaznik 100-200');
+            } else if (activeTab === 1) {
+                ui.text('BTN_ACTION', 'Kasuj Cooldown');
+                ui.text('BTN_RESET_SVC', 'Tryb Warmup');
+            } else if (activeTab === 2) {
+                ui.text('BTN_ACTION', 'Zmien CBS (1/2/3)');
+                const isArmed = Date.now() < serviceConfirmUntil;
+                const it = serviceState.intervals[selectedServiceIdx];
+                ui.text('BTN_RESET_SVC', isArmed ? 'POTWIERDZ RESET!' : 'Resetuj: ' + (it ? it.id : ''));
+            }
+        }
+
+        const flipNext = () => { activeTab = (activeTab + 1) % 3; serviceConfirmUntil = 0; updateBarButtons(); };
+        const flipPrev = () => { activeTab = (activeTab + 2) % 3; serviceConfirmUntil = 0; updateBarButtons(); };
+
+        ui.onClick('BTN_PAGE', flipNext);
+        ui.onClick('BTN_PREV', flipPrev);
+        ctx.onTab((i) => {
+            if (i >= 0 && i < 3 && i !== activeTab) {
+                activeTab = i;
+                serviceConfirmUntil = 0;
+                updateBarButtons();
+            }
+        });
+
+        // Action button handler
+        ui.onClick('BTN_ACTION', () => {
+            if (activeTab === 0) {
+                resetPeaks();
+            } else if (activeTab === 1) {
+                cooldownRemaining = 0;
+            } else if (activeTab === 2) {
+                selectedServiceIdx = (selectedServiceIdx + 1) % serviceState.intervals.length;
+                serviceConfirmUntil = 0;
+                updateBarButtons();
+            }
+        });
+
+        // Service Reset button handler with 5-second double confirmation
+        ui.onClick('BTN_RESET_SVC', () => {
+            if (activeTab === 2) {
+                const now = Date.now();
+                if (now < serviceConfirmUntil) {
+                    // Executing reset
+                    const it = serviceState.intervals[selectedServiceIdx];
+                    if (it) {
+                        it.currentKm = 0;
+                        saveServiceState();
+                        log.info('CBS Reset executed for: ' + it.name);
+                    }
+                    serviceConfirmUntil = 0;
+                } else {
+                    // Armed for 5 seconds
+                    serviceConfirmUntil = now + 5000;
+                }
+                updateBarButtons();
+            } else if (activeTab === 0) {
+                resetPeaks();
+            }
+        });
+
+        /* ---------------- Tab 1: Live Diagnostic Tracking ---------------- */
+        const liveDiag = {
+            boostActual: 0.0,
+            boostTarget: 1.5,
+            iat: 32.0,
+            baseTiming: 12.0,
+            cylCorr: [0.0, 0.0, 0.0, 0.0],
+            peakBoost: 0.0,
+            peakIat: 0.0,
+            peakCorr: [0.0, 0.0, 0.0, 0.0],
+            soc: 65,
+            dischargeKw: 80,
+            derateRatio: 1.0,
+            wot: false
+        };
+
+        function resetPeaks() {
+            liveDiag.peakBoost = liveDiag.boostActual;
+            liveDiag.peakIat = liveDiag.iat;
+            liveDiag.peakCorr = [0.0, 0.0, 0.0, 0.0];
+            log.info('Peaks reset');
+        }
+
+        // DME DIDs:
+        // 0x4205: IPLAD (u16, k: 0.078125 hPa)
+        // 0x4AB0: S_LADEDRUCK (u16, k: 0.0390625 hPa)
+        // 0x580F: ITANS (u8, k: 0.75, o: -48.0 °C)
+        // 0x59FA: I_ZUENDWINKEL (s8, k: 0.75 °CA)
+        // 0x4A49: IZWZ1 (s16, k: 0.1 °CA)
+        // 0x4A4A: IZWZ2 (s16, k: 0.1 °CA)
+        // 0x4A4C: IZWZ3 (s16, k: 0.1 °CA)
+        // 0x4A4D: IZWZ4 (s16, k: 0.1 °CA)
+        const DME_DIDS = [0x4205, 0x4AB0, 0x580F, 0x59FA, 0x4A49, 0x4A4A, 0x4A4C, 0x4A4D];
+        const DME_LENS = { 0x4205: 2, 0x4AB0: 2, 0x580F: 1, 0x59FA: 1, 0x4A49: 2, 0x4A4A: 2, 0x4A4C: 2, 0x4A4D: 2 };
+
+        let diagBusy = false;
+        async function pollDmeDiag() {
+            if (diagBusy || !diag.ready) return;
+            diagBusy = true;
+            try {
+                const reply = await diag.readMany(0x12, DME_DIDS, 1000);
+                if (reply && reply[0] === 0x62) {
+                    const parts = split(reply, DME_LENS);
+                    if (parts) {
+                        // 0x4205: actual boost
+                        if (parts[0x4205]) {
+                            const raw = (parts[0x4205][3] << 8) | parts[0x4205][4];
+                            const hpa = raw * 0.078125;
+                            liveDiag.boostActual = Math.max(0, (hpa - 1013) / 1000);
+                        }
+                        // 0x4AB0: target boost
+                        if (parts[0x4AB0]) {
+                            const raw = (parts[0x4AB0][3] << 8) | parts[0x4AB0][4];
+                            const hpa = raw * 0.0390625;
+                            liveDiag.boostTarget = Math.max(0, (hpa - 1013) / 1000);
+                        }
+                        // 0x580F: IAT
+                        if (parts[0x580F]) {
+                            const raw = parts[0x580F][3];
+                            liveDiag.iat = raw * 0.75 - 48.0;
+                        }
+                        // 0x59FA: Base ignition timing
+                        if (parts[0x59FA]) {
+                            let raw = parts[0x59FA][3];
+                            if (raw >= 128) raw -= 256;
+                            liveDiag.baseTiming = raw * 0.75;
+                        }
+                        // Cylinders 1-4
+                        [0x4A49, 0x4A4A, 0x4A4C, 0x4A4D].forEach((did, idx) => {
+                            if (parts[did]) {
+                                let raw = (parts[did][3] << 8) | parts[did][4];
+                                if (raw >= 32768) raw -= 65536;
+                                const deg = raw * 0.1;
+                                const diff = deg - liveDiag.baseTiming;
+                                liveDiag.cylCorr[idx] = Math.round(diff * 10) / 10;
+                            }
+                        });
+                    }
+                }
+            } catch (err) {
+                // Diag busy or failed, continue cleanly
+            } finally {
+                diagBusy = false;
+            }
+        }
+
+        // Periodically poll DME diagnostics when on Tab 0 (or every 250ms)
+        setInterval(() => {
+            if (activeTab === 0 && diag.ready) {
+                pollDmeDiag();
+            }
+        }, 250);
+
+        /* ---------------- Tab 2: Warmup & Turbo Cooldown Tracking ---------------- */
+        let cooldownRemaining = 0;
+        let lastCooldownTick = Date.now();
+
+        /* ---------------- Synthetic / Demo Driving Generator ---------------- */
+        // Used in emulator on PC or when demo mode is active
+        let demoPhase = 0;
+        let demoOdoAccumulator = 0;
+
+        function updateDemoState(d, dt) {
+            demoPhase += dt * 0.8;
+            const isHardAcc = (Math.sin(demoPhase) > 0.2);
+
+            if (isHardAcc) {
+                liveDiag.wot = true;
+                liveDiag.boostTarget = 1.50;
+                liveDiag.boostActual = Math.min(1.52, Math.max(0.2, 1.48 + 0.05 * Math.sin(demoPhase * 4)));
+                liveDiag.iat = Math.min(48, 33 + 8 * (0.5 + 0.5 * Math.sin(demoPhase * 0.5)));
+                liveDiag.baseTiming = 11.5 + 2 * Math.cos(demoPhase * 2);
+                liveDiag.cylCorr[0] = -0.4;
+                liveDiag.cylCorr[1] = -0.8;
+                // Cyl 3 simulated knock retard under PB95 to demonstrate alert
+                liveDiag.cylCorr[2] = (Math.sin(demoPhase * 2.5) > 0.6) ? -3.4 : -1.2;
+                liveDiag.cylCorr[3] = -0.2;
+            } else {
+                liveDiag.wot = false;
+                liveDiag.boostTarget = 0.60;
+                liveDiag.boostActual = Math.max(0.0, 0.15 * Math.sin(demoPhase));
+                liveDiag.iat = 32.0;
+                liveDiag.baseTiming = 18.0;
+                liveDiag.cylCorr[0] = 0.0;
+                liveDiag.cylCorr[1] = -0.2;
+                liveDiag.cylCorr[2] = -0.4;
+                liveDiag.cylCorr[3] = 0.0;
+            }
+
+            // Simulated battery SoC (drifts slowly between 75% and 22% to showcase BMS Derating)
+            liveDiag.soc = 50 + 28 * Math.sin(demoPhase * 0.15);
+
+            // Virtual odometer progress for demo (adds km to showcase Service Tracker)
+            demoOdoAccumulator += (d.speed || 60) * (dt / 3600);
+            if (demoOdoAccumulator >= 0.1) {
+                const addKm = 0.1;
+                demoOdoAccumulator -= 0.1;
+                const odo = (serviceState.lastOdo || 113000) + addKm;
+                updateOdometer(odo, d.rpm, d.speed);
+            }
+        }
+
+        /* ---------------- Background Odometer Tracking ---------------- */
+        function updateOdometer(newOdo, rpm, speed) {
+            if (!G.isNum(newOdo) || newOdo <= 0) return;
+            if (!serviceState.lastOdo) {
+                serviceState.lastOdo = newOdo;
+                saveServiceState();
+                return;
+            }
+            const delta = newOdo - serviceState.lastOdo;
+            if (delta > 0 && delta < 50) {
+                if (G.isNum(rpm) && rpm > 0) {
+                    serviceState.totalIceKm += delta;
+                    serviceState.intervals.forEach((it) => { it.currentKm += delta; });
+                } else {
+                    serviceState.totalEvKm += delta;
+                }
+                serviceState.lastOdo = newOdo;
+                saveServiceState();
+            }
+        }
+
+        // Watch SOME/IP odometer signal
+        ctx.signals.watch('de.bmw.infotainment.KombiIF', '1', {
+            statusRangeTankStatus: (v) => {
+                if (v && G.isNum(v.mileageKilometre) && v.mileageKilometre < 16777215) {
+                    const d = car.data();
+                    updateOdometer(v.mileageKilometre, d.rpm, d.speed);
+                }
+            }
+        }, log).catch((e) => log.warn('KombiIF watch: ' + e));
+
+        // Watch battery storage info
+        ctx.signals.watch('de.bmw.infotainment.lsc.LSCDataSink', '1', {
+            statusHighVoltageStorage: (v) => {
+                if (v && G.isNum(v.actualValueStateOfCharge)) {
+                    liveDiag.soc = v.actualValueStateOfCharge;
+                }
+            }
+        }, log).catch((e) => log.warn('LSCDataSink watch: ' + e));
+
+        // Watch battery distribution
+        ctx.signals.watch('de.bmw.infotainment.KombiIF', '1', {
+            statusDisplayElectricalPowerDistribution: (v) => {
+                if (v && G.isNum(v.displayRepartitionDriveElectricPower)) {
+                    // Distribution factor
+                }
+            }
+        }, log).catch((e) => log.warn('KombiIF distribution: ' + e));
+
+        /* ---------------- Main 60 FPS Render Loop ---------------- */
+        ctx.loop('MAIN', 60, () => {
+            const t = ctx.theme();
+            const cv = ctx.canvas(W, H).clear(t.bg);
+            const d = car.data();
+            const now = Date.now();
+            const dt = Math.min(0.1, Math.max(0.001, (now - lastCooldownTick) / 1000));
+            lastCooldownTick = now;
+
+            // In demo / emulator mode, update simulated state
+            const isDemo = (!diag.ready) || settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && d.demo);
+            if (isDemo) {
+                updateDemoState(d, dt);
+            }
+
+            // 1. Calculate B48 ICE Performance
+            const rpm = G.isNum(d.rpm) ? d.rpm : 0;
+            const iceTorque = G.isNum(d.torque) && d.torque > 0 ? d.torque : 0;
+            const iceKw = (iceTorque * rpm) / 9549;
+            const iceHp = iceKw * 1.35962;
+
+            // 2. Calculate EME Electric Performance & BMS Derating
+            const soc = G.isNum(liveDiag.soc) ? liveDiag.soc : 60;
+            // BMS derates below 30% SoC down to ~70% at 15% SoC
+            let derateRatio = 1.0;
+            if (soc < 30) {
+                derateRatio = G.clamp(0.45 + (soc / 30) * 0.55, 0.45, 1.0);
+            }
+            liveDiag.derateRatio = derateRatio;
+
+            const evMaxHp = Math.round(SPEC.evMaxHp * derateRatio);
+            const evMaxNm = Math.round(SPEC.evMaxNm * derateRatio);
+            const lostHp = SPEC.evMaxHp - evMaxHp;
+            const lostNm = SPEC.evMaxNm - evMaxNm;
+
+            // Electric load follows throttle/acceleration
+            const accelPct = G.clamp((rpm / 4500) * (iceTorque / 350 || 0.5), 0, 1);
+            const evHp = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxHp * accelPct) : 0;
+            const evTorque = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxNm * accelPct) : 0;
+
+            // 3. System Power (ICE + EME)
+            const systemHp = Math.round(iceHp + evHp);
+
+            // 4. Update WOT & Peaks
+            if (liveDiag.boostActual > 1.0 || (iceTorque > 350 && rpm > 3200)) {
+                liveDiag.wot = true;
+                liveDiag.peakBoost = Math.max(liveDiag.peakBoost, liveDiag.boostActual);
+                liveDiag.peakIat = Math.max(liveDiag.peakIat, liveDiag.iat);
+                for (let c = 0; c < 4; c++) {
+                    liveDiag.peakCorr[c] = Math.min(liveDiag.peakCorr[c], liveDiag.cylCorr[c]);
+                }
+            }
+
+            // 5. Turbo Cooldown Timer Logic
+            const oilTemp = G.isNum(d.oil) ? d.oil : 88;
+            const coolantTemp = G.isNum(d.coolant) ? d.coolant : 92;
+            const isHardDriving = (liveDiag.boostActual > 1.0) || (rpm > 3900 && iceTorque > 300) || (oilTemp > 102);
+
+            if (isHardDriving) {
+                cooldownRemaining = settings.get('cooldownSec') || 90;
+            } else if (cooldownRemaining > 0) {
+                // Cools down when gentle (rpm < 2200 and low boost) or idling
+                const isGentle = (rpm < 2200 && liveDiag.boostActual < 0.25);
+                if (isGentle) {
+                    cooldownRemaining = Math.max(0, cooldownRemaining - dt);
+                }
+            }
+
+            // 100-200 READY Assessment
+            const oilOk = (oilTemp >= 85 && oilTemp <= 108);
+            const iatOk = (liveDiag.iat < 45);
+            const bmsOk = (derateRatio >= 0.98);
+            const ready100_200 = oilOk && iatOk && bmsOk;
+
+            // Badges in header
+            const badges = [];
+            if (isDemo) badges.push({ text: 'DEMO', color: 'accent' });
+            if (cooldownRemaining > 0) badges.push({ text: 'COOLDOWN ' + Math.ceil(cooldownRemaining) + 's', color: 'warn' });
+            if (ready100_200) badges.push({ text: '420 KM READY', color: GO });
+
+            // Draw full-screen frame with 3 tabs
+            G.frame(cv, t, TABS, activeTab, badges);
+
+            // Render current active tab content
+            if (activeTab === 0) {
+                renderTab1_XtraBoostGuard(cv, t, {
+                    rpm, iceHp, iceTorque, evHp, evTorque, evMaxHp, evMaxNm,
+                    lostHp, lostNm, derateRatio, soc, systemHp, ready100_200,
+                    oilOk, iatOk, bmsOk, oilTemp
+                });
+            } else if (activeTab === 1) {
+                renderTab2_WarmupTurbo(cv, t, {
+                    oilTemp, coolantTemp, rpm, isHardDriving, cooldownRemaining
+                });
+            } else if (activeTab === 2) {
+                renderTab3_ServiceTracker(cv, t);
+            }
+        });
+
+        /* =========================================================================
+         * TAB 1: XTRABOOST GUARD (Dual Power Split, BMS Detector, 100-200, Fuel)
+         * ========================================================================= */
+        function renderTab1_XtraBoostGuard(cv, t, p) {
+            const colW = 500;
+            const topY = 46;
+            const h = 466;
+
+            // ---------------- Left Column: Dual Power Split ----------------
+            G.panel(cv, t, 16, topY, colW, h, 'MOC SILNIKOW (DUAL POWER SPLIT)');
+
+            // B48 ICE section
+            cv.text('SILNIK B48 (SPALINOWY - STAGE 1)', 36, topY + 68, 20, t.text, { font: 'bold' });
+            G.bar(cv, t, 36, topY + 76, colW - 40, 60, {
+                label: 'MOC B48',
+                unit: 'KM',
+                value: p.iceHp,
+                min: 0,
+                max: 340,
+                decimals: 0,
+                color: BLUE,
+                peak: Math.max(p.iceHp, SPEC.iceMaxHp * 0.95),
+                zones: [{ from: 300, to: 340, color: CRIT }]
+            });
+
+            G.bar(cv, t, 36, topY + 154, colW - 40, 60, {
+                label: 'MOMENT B48',
+                unit: 'Nm',
+                value: p.iceTorque,
+                min: 0,
+                max: 500,
+                decimals: 0,
+                color: BLUE,
+                peak: Math.max(p.iceTorque, SPEC.iceMaxNm * 0.95),
+                zones: [{ from: 430, to: 500, color: CRIT }]
+            });
+
+            // EME Electric Motor section
+            cv.fillRect(36, topY + 236, colW - 40, 1, withAlpha('#ffffff', 0.12));
+            cv.text('SILNIK ELEKTRYCZNY (EME - XTRABOOST)', 36, topY + 264, 20, p.derateRatio < 0.98 ? WARN : M_CYAN, { font: 'bold' });
+
+            G.bar(cv, t, 36, topY + 272, colW - 40, 60, {
+                label: 'MOC ELEKTRYCZNA',
+                unit: 'KM',
+                value: p.evHp,
+                min: 0,
+                max: 120,
+                decimals: 0,
+                color: p.derateRatio < 0.98 ? WARN : M_CYAN,
+                peak: p.evMaxHp
+            });
+
+            G.bar(cv, t, 36, topY + 350, colW - 40, 60, {
+                label: 'MOMENT ELEKTRYCZNY',
+                unit: 'Nm',
+                value: p.evTorque,
+                min: 0,
+                max: 300,
+                decimals: 0,
+                color: p.derateRatio < 0.98 ? WARN : M_CYAN,
+                peak: p.evMaxNm
+            });
+
+            // BMS Derating Alert Banner
+            if (p.derateRatio < 0.98) {
+                cv.roundRect(36, topY + 418, colW - 40, 42, 6, withAlpha(WARN, 0.22));
+                cv.strokeRoundRect(36, topY + 418, colW - 40, 42, 6, 1.5, WARN);
+                cv.text('BMS DERATING: -' + p.lostHp + ' KM / -' + p.lostNm + ' Nm (Niski SoC ' + p.soc.toFixed(0) + '%)',
+                    36 + (colW - 40) / 2, topY + 444, 18, WARN, { align: 'center', font: 'bold' });
+            } else {
+                cv.roundRect(36, topY + 418, colW - 40, 42, 6, withAlpha(GO, 0.15));
+                cv.strokeRoundRect(36, topY + 418, colW - 40, 42, 6, 1.5, withAlpha(GO, 0.6));
+                cv.text('XTRABOOST 100% (109 KM / 265 Nm OK) - SoC ' + p.soc.toFixed(0) + '%',
+                    36 + (colW - 40) / 2, topY + 444, 18, GO, { align: 'center', font: 'bold' });
+            }
+
+            // ---------------- Middle Column: System Power & 100-200 Ready ----------------
+            const midX = 534;
+            const midW = 532;
+            G.panel(cv, t, midX, topY, midW, h, 'MOC SYSTEMOWA & 100-200 READY');
+
+            // System Power Display
+            cv.text('MOC SYSTEMOWA (HYBRYDA B48 + EME)', midX + midW / 2, topY + 68, 20, t.dim, { align: 'center', font: 'bold', spacing: 1.5 });
+            const pwrStr = String(p.systemHp);
+            const pw = cv.text(pwrStr, midX + midW / 2 - 32, topY + 145, 84, p.systemHp >= 400 ? GO : t.text, { align: 'center', font: 'num' });
+            cv.text('KM', midX + midW / 2 + pw / 2 + 10, topY + 138, 32, t.dim, { font: 'bold' });
+
+            // System Power Bar
+            G.bar(cv, t, midX + 30, topY + 158, midW - 60, 48, {
+                label: '',
+                head: false,
+                value: p.systemHp,
+                min: 0,
+                max: 450,
+                color: GO,
+                zones: [{ from: 410, to: 450, color: GO }]
+            });
+
+            // 100-200 Readiness Card
+            cv.fillRect(midX + 30, topY + 224, midW - 60, 1, withAlpha('#ffffff', 0.12));
+            cv.text('STATUS GOTOWOSCI DO POMIARU 100-200 KM/H', midX + midW / 2, topY + 252, 20, t.text, { align: 'center', font: 'bold' });
+
+            const rCardY = topY + 268;
+            const rCardH = 188;
+            if (p.ready100_200) {
+                // Green Ready
+                cv.roundRect(midX + 30, rCardY, midW - 60, rCardH, 10, withAlpha(GO, 0.22));
+                cv.strokeRoundRect(midX + 30, rCardY, midW - 60, rCardH, 10, 2, GO);
+                cv.text('GOTOWY - 420 KM', midX + midW / 2, rCardY + 48, 38, GO, { align: 'center', font: 'bold', spacing: 2 });
+                cv.text('(100-200 READY - PELNA MOC)', midX + midW / 2, rCardY + 84, 22, GO, { align: 'center', font: 'bold' });
+
+                cv.fillRect(midX + 60, rCardY + 104, midW - 120, 1, withAlpha(GO, 0.3));
+                cv.text('✓ Temp. oleju: ' + p.oilTemp.toFixed(0) + '°C (85-108°C)', midX + 60, rCardY + 130, 20, t.text);
+                cv.text('✓ Temp. dolotu (IAT): ' + liveDiag.iat.toFixed(0) + '°C (< 45°C)', midX + 60, rCardY + 154, 20, t.text);
+                cv.text('✓ Bateria XtraBoost: 100% mocy elektryka', midX + 60, rCardY + 178, 20, t.text);
+            } else {
+                // Not Ready
+                const cardCol = (!p.oilOk && p.oilTemp < 60) ? CRIT : WARN;
+                cv.roundRect(midX + 30, rCardY, midW - 60, rCardH, 10, withAlpha(cardCol, 0.16));
+                cv.strokeRoundRect(midX + 30, rCardY, midW - 60, rCardH, 10, 2, cardCol);
+                cv.text('BLOKADA POMIARU 100-200', midX + midW / 2, rCardY + 42, 30, cardCol, { align: 'center', font: 'bold', spacing: 1.5 });
+
+                let by = rCardY + 82;
+                if (!p.oilOk) {
+                    const why = p.oilTemp < 85 ? 'Zimny olej (' + p.oilTemp.toFixed(0) + '°C < 85°C)' : 'Za goracy olej (' + p.oilTemp.toFixed(0) + '°C > 108°C)';
+                    cv.text('✗ ' + why, midX + 50, by, 21, CRIT, { font: 'bold' });
+                    by += 28;
+                }
+                if (!p.iatOk) {
+                    cv.text('✗ Za wysoka IAT (' + liveDiag.iat.toFixed(0) + '°C >= 45°C)', midX + 50, by, 21, WARN, { font: 'bold' });
+                    by += 28;
+                }
+                if (!p.bmsOk) {
+                    cv.text('✗ BMS obcina moc elektryka (SoC ' + p.soc.toFixed(0) + '%)', midX + 50, by, 21, WARN, { font: 'bold' });
+                    by += 28;
+                }
+            }
+
+            // ---------------- Right Column: Fuel & Knock Monitor ----------------
+            const rightX = 1084;
+            const rightW = 500;
+            G.panel(cv, t, rightX, topY, rightW, h, 'MONITOR PALIWA & ZAPLONU (0x12 DME)');
+
+            // Boost Pressure Actual vs Target
+            G.bar(cv, t, rightX + 24, topY + 68, rightW - 40, 60, {
+                label: 'DOLADOWANIE (CEL ' + SPEC.targetBoostBar.toFixed(1) + ' BAR)',
+                unit: 'bar',
+                value: liveDiag.boostActual,
+                min: 0,
+                max: 2.0,
+                decimals: 2,
+                color: BLUE,
+                peak: liveDiag.peakBoost,
+                zones: [{ from: 1.45, to: 1.65, color: GO }, { from: 1.65, to: 2.0, color: CRIT }]
+            });
+
+            // IAT Readout
+            G.bar(cv, t, rightX + 24, topY + 146, rightW - 40, 60, {
+                label: 'TEMP. W DOLOCIE (IAT)',
+                unit: '°C',
+                value: liveDiag.iat,
+                min: 10,
+                max: 60,
+                decimals: 0,
+                color: liveDiag.iat >= 45 ? CRIT : liveDiag.iat >= 38 ? WARN : GO,
+                peak: liveDiag.peakIat,
+                zones: [{ from: 45, to: 60, color: CRIT }]
+            });
+
+            // Ignition Timing & Cylinder Corrections
+            cv.fillRect(rightX + 24, topY + 226, rightW - 40, 1, withAlpha('#ffffff', 0.12));
+            cv.text('KAT ZAPLONU: ' + liveDiag.baseTiming.toFixed(1) + '°CA (CYLINDRY 1-4 KOREKTY)', rightX + 24, topY + 254, 19, t.text, { font: 'bold' });
+
+            const thresh = settings.get('knockThreshold') || -3.0;
+            let knockDetected = false;
+
+            // 4 Cylinder Knock Correction Boxes
+            const boxW = (rightW - 40 - 24) / 4;
+            for (let c = 0; c < 4; c++) {
+                const bx = rightX + 24 + c * (boxW + 8);
+                const by = topY + 268;
+                const corr = liveDiag.cylCorr[c];
+                const pCorr = liveDiag.peakCorr[c];
+                const bad = pCorr <= thresh;
+                if (bad) knockDetected = true;
+
+                cv.roundRect(bx, by, boxW, 76, 6, withAlpha(bad ? CRIT : '#ffffff', bad ? 0.22 : 0.06));
+                cv.strokeRoundRect(bx, by, boxW, 76, 6, 1.5, bad ? CRIT : withAlpha('#ffffff', 0.2));
+
+                cv.text('CYL ' + (c + 1), bx + boxW / 2, by + 22, 17, t.dim, { align: 'center', font: 'bold' });
+                cv.text((corr > 0 ? '+' : '') + corr.toFixed(1) + '°', bx + boxW / 2, by + 46, 21, bad ? CRIT : t.text, { align: 'center', font: 'num' });
+                cv.text('Peak ' + (pCorr > 0 ? '+' : '') + pCorr.toFixed(1) + '°', bx + boxW / 2, by + 66, 15, bad ? CRIT : t.dim, { align: 'center' });
+            }
+
+            // Knock / Fuel Quality Verdict Banner
+            const verdictY = topY + 360;
+            if (knockDetected) {
+                cv.roundRect(rightX + 24, verdictY, rightW - 40, 90, 8, withAlpha(CRIT, 0.22));
+                cv.strokeRoundRect(rightX + 24, verdictY, rightW - 40, 90, 8, 2, CRIT);
+                cv.text('WYKRYTO KOREKTE < ' + thresh.toFixed(1) + '° (STUKOWE)', rightX + rightW / 2, verdictY + 28, 20, CRIT, { align: 'center', font: 'bold' });
+                cv.text('Paliwo PB95 / za niska liczba oktanowa!', rightX + rightW / 2, verdictY + 52, 18, t.text, { align: 'center' });
+                cv.text('Zalecane: PB98 + dodatek Millers EcoMax', rightX + rightW / 2, verdictY + 76, 18, GO, { align: 'center', font: 'bold' });
+            } else {
+                cv.roundRect(rightX + 24, verdictY, rightW - 40, 90, 8, withAlpha(GO, 0.15));
+                cv.strokeRoundRect(rightX + 24, verdictY, rightW - 40, 90, 8, 1.5, withAlpha(GO, 0.6));
+                cv.text('ZAPLON STABILNY - PALIWO PB98 / ECOMAX OK', rightX + rightW / 2, verdictY + 32, 19, GO, { align: 'center', font: 'bold' });
+                cv.text('Brak niebezpiecznych korekt zaplonu na WOT', rightX + rightW / 2, verdictY + 58, 17, t.text, { align: 'center' });
+                cv.text('Dolny przycisk: Reset Peak po kolejnym pullu', rightX + rightW / 2, verdictY + 78, 15, t.dim, { align: 'center' });
+            }
+        }
+
+        /* =========================================================================
+         * TAB 2: WARMUP & TURBO (Ochrona Zimnego B48, Dynamiczny Limit, Cooldown)
+         * ========================================================================= */
+        function renderTab2_WarmupTurbo(cv, t, p) {
+            const colW = 764;
+            const topY = 46;
+            const h = 466;
+
+            // ---------------- Left Column: Warmup & Cold-Start Guard ----------------
+            G.panel(cv, t, 16, topY, colW, h, 'ROZGRZEWANIE SILNIKA B48 & HYBRID COLD-START GUARD');
+
+            // Oil & Coolant Gauges
+            const gaugeW = (colW - 60) / 2;
+            G.panel(cv, t, 36, topY + 58, gaugeW, 134, 'TEMPERATURA OLEJU');
+            const oilCol = p.oilTemp < 50 ? M_CYAN : p.oilTemp < 80 ? WARN : p.oilTemp > 108 ? CRIT : GO;
+            cv.text(p.oilTemp.toFixed(0) + ' °C', 36 + gaugeW / 2, topY + 130, 48, oilCol, { align: 'center', font: 'num' });
+            const oilStateTxt = p.oilTemp < 50 ? 'ZIMNY' : p.oilTemp < 80 ? 'ROZGRZEWANIE' : 'ROBOCZA';
+            cv.text(oilStateTxt, 36 + gaugeW / 2, topY + 166, 20, oilCol, { align: 'center', font: 'bold' });
+
+            G.panel(cv, t, 36 + gaugeW + 20, topY + 58, gaugeW, 134, 'PLYN CHLODNICZY');
+            const cCol = p.coolantTemp < 70 ? M_CYAN : GO;
+            cv.text(p.coolantTemp.toFixed(0) + ' °C', 36 + gaugeW + 20 + gaugeW / 2, topY + 130, 48, cCol, { align: 'center', font: 'num' });
+            cv.text(p.coolantTemp >= 80 ? 'ROBOCZA' : 'ROZGRZEWANIE', 36 + gaugeW + 20 + gaugeW / 2, topY + 166, 20, cCol, { align: 'center', font: 'bold' });
+
+            // Dynamic Limits calculation
+            let modeTitle, modeCol, safeRpm, safeBoost;
+            if (p.oilTemp < 50) {
+                modeTitle = 'TRYB ZIMNY (B48 COLD GUARD)';
+                modeCol = M_CYAN;
+                safeRpm = 2500;
+                safeBoost = 0.0;
+            } else if (p.oilTemp < 80) {
+                modeTitle = 'TRYB ROZGRZEWANIA';
+                modeCol = WARN;
+                const ratio = (p.oilTemp - 50) / 30;
+                safeRpm = Math.round(2800 + (4200 - 2800) * ratio);
+                safeBoost = 0.60;
+            } else {
+                modeTitle = 'TEMPERATURA ROBOCZA (STAGE 1 ODBLOKOWANY)';
+                modeCol = GO;
+                safeRpm = 6500;
+                safeBoost = 1.50;
+            }
+
+            // Mode Card
+            const cardY = topY + 210;
+            cv.roundRect(36, cardY, colW - 40, 110, 8, withAlpha(modeCol, 0.18));
+            cv.strokeRoundRect(36, cardY, colW - 40, 110, 8, 2, modeCol);
+
+            cv.text(modeTitle, 56, cardY + 34, 24, modeCol, { font: 'bold', spacing: 1.5 });
+            cv.text('BEZPIECZNY PUAP OBROTOW: ' + safeRpm + ' RPM', 56, cardY + 68, 22, t.text, { font: 'bold' });
+            cv.text('MAX DOZWOLONE DOLADOWANIE: ' + safeBoost.toFixed(1) + ' bar', 56, cardY + 96, 22, t.text, { font: 'bold' });
+
+            // Visual Throttle Alert when Cold Engine Over-revved
+            const overrev = (p.oilTemp < 50 && p.rpm > 2500);
+            if (overrev) {
+                cv.roundRect(36, topY + 338, colW - 40, 110, 8, withAlpha(CRIT, 0.3));
+                cv.strokeRoundRect(36, topY + 338, colW - 40, 110, 8, 2.5, CRIT);
+                cv.text('UWAGA: ZIMNY SILNIK! OGRANICZ GAZ!', 36 + (colW - 40) / 2, topY + 376, 28, CRIT, { align: 'center', font: 'bold', spacing: 2 });
+                cv.text('B48 uruchomiony w hybrydzie przy zimnym oleju. Zwolnij obroty ponizej 2500 RPM!',
+                    36 + (colW - 40) / 2, topY + 414, 20, t.text, { align: 'center' });
+            } else {
+                // RPM Bar
+                G.bar(cv, t, 36, topY + 344, colW - 40, 60, {
+                    label: 'OBROTY SILNIKA B48',
+                    unit: 'RPM',
+                    value: p.rpm,
+                    min: 0,
+                    max: 7000,
+                    decimals: 0,
+                    color: p.rpm > safeRpm ? CRIT : BLUE,
+                    peak: safeRpm
+                });
+                cv.text('Hybryda 530e uruchamia B48 nagle przy wyprzedzaniu - kontroluj limit!', 56, topY + 434, 18, t.dim);
+            }
+
+            // ---------------- Right Column: Turbo Cooldown & PHEV Warning ----------------
+            const rightX = 820;
+            G.panel(cv, t, rightX, topY, colW, h, 'STRAZNIK CHLODZENIA TURBINY (PHEV S/S GUARD)');
+
+            const coolActive = (p.cooldownRemaining > 0);
+            const coolH = 390;
+
+            if (coolActive) {
+                // Active Cooldown Warning Panel
+                cv.roundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, withAlpha(CRIT, 0.22));
+                cv.strokeRoundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, 2.5, CRIT);
+
+                cv.text('NIE GAS B48!', rightX + colW / 2, topY + 112, 44, CRIT, { align: 'center', font: 'bold', spacing: 3 });
+                cv.text('Wlacz tryb SPORT lub przesun dzwignie w S,', rightX + colW / 2, topY + 158, 26, t.text, { align: 'center', font: 'bold' });
+                cv.text('aby hybryda nie wylaczyla obiegu oleju na postoju!', rightX + colW / 2, topY + 194, 26, WARN, { align: 'center', font: 'bold' });
+
+                // Big Countdown timer
+                cv.fillRect(rightX + 60, topY + 224, colW - 120, 1, withAlpha(CRIT, 0.3));
+                cv.text('POZOSTALO CHLODZENIA TURBINY', rightX + colW / 2, topY + 258, 22, t.dim, { align: 'center', font: 'bold', spacing: 1.5 });
+
+                const cdStr = String(Math.ceil(p.cooldownRemaining));
+                const cdw = cv.text(cdStr, rightX + colW / 2 - 20, topY + 346, 96, CRIT, { align: 'center', font: 'num' });
+                cv.text('sekund', rightX + colW / 2 + cdw / 2 + 15, topY + 338, 28, t.dim);
+
+                // Cooldown progress bar
+                const totalCd = settings.get('cooldownSec') || 90;
+                const progress = G.clamp(1.0 - (p.cooldownRemaining / totalCd), 0, 1);
+                cv.fillRect(rightX + 60, topY + 380, colW - 120, 14, withAlpha('#ffffff', 0.15));
+                cv.fillRect(rightX + 60, topY + 380, Math.round((colW - 120) * progress), 14, GO);
+                cv.text('Postoj z pracujacym silnikiem lub spokojna jazda', rightX + colW / 2, topY + 424, 19, t.dim, { align: 'center' });
+            } else {
+                // Cooldown completed / idle
+                cv.roundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, withAlpha(GO, 0.15));
+                cv.strokeRoundRect(rightX + 24, topY + 58, colW - 48, coolH, 12, 1.5, withAlpha(GO, 0.6));
+
+                cv.text('TURBINA SCHLODZONA', rightX + colW / 2, topY + 120, 36, GO, { align: 'center', font: 'bold', spacing: 2 });
+                cv.text('Temperatura turbosprezarki i oleju w normie.', rightX + colW / 2, topY + 168, 24, t.text, { align: 'center' });
+                cv.text('Mozna bezpiecznie wylaczyc silnik lub przejsc w tryb EV.', rightX + colW / 2, topY + 208, 22, GO, { align: 'center' });
+
+                cv.fillRect(rightX + 60, topY + 250, colW - 120, 1, withAlpha('#ffffff', 0.12));
+                cv.text('WARUNKI AKTYWACJI STRAZNIKA:', rightX + 60, topY + 288, 20, t.dim, { font: 'bold', spacing: 1.5 });
+                cv.text('• Doladowanie B48 > 1.0 bar (Stage 1 Boost)', rightX + 60, topY + 322, 21, t.text);
+                cv.text('• Obroty > 3900 RPM i moment > 300 Nm', rightX + 60, topY + 356, 21, t.text);
+                cv.text('• Temperatura oleju > 102°C', rightX + 60, topY + 390, 21, t.text);
+                cv.text('Automatyczny timer 90s zapobiega naglemu odcieciu smarowania w PHEV.', rightX + 60, topY + 426, 18, t.dim);
+            }
+        }
+
+        /* =========================================================================
+         * TAB 3: SERVICE TRACKER (Inteligentny Licznik Przebiegu B48 vs EV)
+         * ========================================================================= */
+        function renderTab3_ServiceTracker(cv, t) {
+            const topY = 46;
+            const h = 466;
+
+            // ---------------- Left / Center: Service Intervals ----------------
+            const leftW = 1040;
+            G.panel(cv, t, 16, topY, leftW, h, 'INTELIGENTNY LICZNIK SERWISOWY (B48 OPERATING KM)');
+
+            cv.text('INTERWALY PRACY SILNIKA SPALINOWEGO (ZLICZANE GDY RPM > 0)', 36, topY + 68, 19, t.dim, { font: 'bold', spacing: 1.5 });
+
+            const itemY0 = topY + 86;
+            const itemH = 104;
+
+            serviceState.intervals.forEach((it, idx) => {
+                const iy = itemY0 + idx * (itemH + 12);
+                const isSelected = (idx === selectedServiceIdx);
+                const isArmed = isSelected && (Date.now() < serviceConfirmUntil);
+
+                const current = it.currentKm || 0;
+                const limit = it.limitKm || 10000;
+                const remaining = Math.max(0, limit - current);
+                const wearPct = G.clamp(Math.round((current / limit) * 100), 0, 100);
+
+                let pCol = GO;
+                if (wearPct >= 90) pCol = CRIT;
+                else if (wearPct >= 70) pCol = WARN;
+
+                // Item Container Box
+                cv.roundRect(36, iy, leftW - 40, itemH, 8, withAlpha(isSelected ? BLUE : '#ffffff', isSelected ? 0.20 : 0.05));
+                cv.strokeRoundRect(36, iy, leftW - 40, itemH, 8, isSelected ? 2 : 1, isSelected ? (isArmed ? CRIT : BLUE) : withAlpha('#ffffff', 0.15));
+
+                // Title & Details
+                const titleStr = it.name;
+                cv.text(titleStr, 56, iy + 30, 24, isSelected ? t.text : t.text, { font: 'bold' });
+                cv.text(it.spec || '', 56, iy + 52, 17, t.dim);
+
+                // Numbers right-aligned
+                const numStr = current.toFixed(0) + ' / ' + limit + ' km B48';
+                cv.text(numStr, leftW - 24, iy + 30, 24, t.text, { align: 'right', font: 'num' });
+                cv.text('Pozostalo: ' + remaining.toFixed(0) + ' km (' + wearPct + '% zuzycia)', leftW - 24, iy + 52, 18, pCol, { align: 'right', font: 'bold' });
+
+                // Progress Bar
+                const barX = 56;
+                const barY = iy + 68;
+                const barW = leftW - 40 - 40;
+                const barH = 16;
+                cv.roundRect(barX, barY, barW, barH, 4, withAlpha('#ffffff', 0.15));
+                const fillW = Math.round(barW * (wearPct / 100));
+                if (fillW > 0) {
+                    cv.roundRect(barX, barY, fillW, barH, 4, pCol);
+                }
+
+                // Selection marker
+                if (isSelected) {
+                    cv.text('►', 40, iy + 42, 20, isArmed ? CRIT : BLUE);
+                }
+            });
+
+            // Action / Reset instructions
+            const noteY = topY + 444;
+            const isArmed = Date.now() < serviceConfirmUntil;
+            if (isArmed) {
+                const it = serviceState.intervals[selectedServiceIdx];
+                cv.text('POTWIERDZ RESET DLA: ' + (it ? it.name : '') + ' (KLIKNIJ PONOWNIE W CIAGU 5s)',
+                    leftW / 2, noteY, 20, CRIT, { align: 'center', font: 'bold' });
+            } else {
+                cv.text('Wybierz pozycje przyciskiem "Zmien CBS" lub dotykiem | Podwojne klikniecie chroni przed przypadkowym resetem',
+                    leftW / 2, noteY, 18, t.dim, { align: 'center' });
+            }
+
+            // ---------------- Right Column: Hybrid Trip & Mileage Split ----------------
+            const rightX = 1076;
+            const rightW = 508;
+            G.panel(cv, t, rightX, topY, rightW, h, 'BILANS PRZEBIEGU HYBRYDY (PHEV)');
+
+            const totalIce = serviceState.totalIceKm || 0;
+            const totalEv = serviceState.totalEvKm || 0;
+            const totalTracked = totalIce + totalEv;
+            const evPct = totalTracked > 0 ? Math.round((totalEv / totalTracked) * 100) : 0;
+            const totalOdo = (serviceState.baseOdo || 113000) + totalTracked;
+
+            // Total Odometer Display
+            cv.text('CALKOWITY PRZEBIEG AUTA (ODOMETER)', rightX + 24, topY + 70, 19, t.dim, { font: 'bold', spacing: 1.5 });
+            cv.text(totalOdo.toFixed(0) + ' km', rightX + 24, topY + 116, 42, t.text, { font: 'num' });
+
+            cv.fillRect(rightX + 24, topY + 138, rightW - 48, 1, withAlpha('#ffffff', 0.12));
+
+            // ICE vs EV Statistics Tiles
+            cv.text('ROZDZIAL PRZEBIEGU W TYM CYKLU:', rightX + 24, topY + 168, 19, t.dim, { font: 'bold', spacing: 1.5 });
+
+            // B48 ICE Tile
+            cv.roundRect(rightX + 24, topY + 184, rightW - 48, 64, 8, withAlpha(BLUE, 0.15));
+            cv.strokeRoundRect(rightX + 24, topY + 184, rightW - 48, 64, 8, 1, withAlpha(BLUE, 0.6));
+            cv.text('PRACA SILNIKA B48 (RPM > 0):', rightX + 44, topY + 212, 19, t.text, { font: 'bold' });
+            cv.text(totalIce.toFixed(1) + ' km', rightX + rightW - 48, topY + 224, 26, BLUE, { align: 'right', font: 'num' });
+
+            // EV Tile
+            cv.roundRect(rightX + 24, topY + 260, rightW - 48, 64, 8, withAlpha(GO, 0.15));
+            cv.strokeRoundRect(rightX + 24, topY + 260, rightW - 48, 64, 8, 1, withAlpha(GO, 0.6));
+            cv.text('JAZDA BEZEMISYJNA EV (RPM == 0):', rightX + 44, topY + 288, 19, t.text, { font: 'bold' });
+            cv.text(totalEv.toFixed(1) + ' km', rightX + rightW - 48, topY + 300, 26, GO, { align: 'right', font: 'num' });
+
+            // EV Share % Bar
+            cv.text('UDZIAL JAZDY NA PRADZIE: ' + evPct + '%', rightX + 24, topY + 358, 20, GO, { font: 'bold' });
+            cv.roundRect(rightX + 24, topY + 372, rightW - 48, 18, 4, withAlpha('#ffffff', 0.15));
+            cv.roundRect(rightX + 24, topY + 372, Math.round((rightW - 48) * (evPct / 100)), 18, 4, GO);
+
+            // Explanatory badge
+            cv.text('Olej, filtr i swiece zuzywaja sie tylko wtedy,', rightX + 24, topY + 420, 17, t.dim);
+            cv.text('gdy silnik B48 fizycznie pracuje. Prad nie zuzywa B48!', rightX + 24, topY + 444, 17, GO, { font: 'bold' });
+        }
+    }
+});
