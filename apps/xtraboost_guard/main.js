@@ -63,54 +63,91 @@ const DEFAULT_SERVICE_STATE = {
     ]
 };
 
+/* ---------------- Fallback Emergency Crash Screen ---------------- */
+function drawCrashScreen(cv, t, err, stage) {
+    cv.clear('#0d0505');
+    // Top alert banner
+    cv.roundRect(20, 20, W - 40, 70, 8, '#770000');
+    cv.text('BLAD KRYTYCZNY (CRASH) W IDRIVE - XTRABOOST GUARD', 40, 64, 26, '#ffffff', { font: 'bold' });
+
+    // Details panel
+    cv.roundRect(20, 106, W - 40, 394, 8, withAlpha('#ffffff', 0.05));
+    cv.strokeRoundRect(20, 106, W - 40, 394, 8, 2, '#ff3333');
+
+    cv.text('ETAP WYSTAPIENIA BLEDU: ' + (stage || 'STARTUP / RENDER'), 40, 145, 20, WARN, { font: 'bold' });
+
+    const errMsg = String(err && err.message ? err.message : err);
+    cv.text('KOMUNIKAT BLEDU:', 40, 185, 18, '#aaaaaa', { font: 'bold' });
+    cv.roundRect(40, 200, W - 80, 50, 6, '#220000');
+    cv.text(errMsg.slice(0, 110), 55, 234, 20, '#ff6666', { font: 'bold' });
+
+    cv.text('STACK TRACE (SLAD BLEDU):', 40, 280, 18, '#aaaaaa', { font: 'bold' });
+    const stack = (err && err.stack ? err.stack.split('\n') : [errMsg]).slice(0, 7);
+    stack.forEach((line, i) => {
+        cv.text(line.trim().slice(0, 130), 50, 312 + i * 24, 16, '#dddddd');
+    });
+
+    cv.text('APLIKACJA NIE ZOSTALA ZAMKNIETA. Zrob zdjecie powyzszego bledu, aby zidentyfikowac przyczyne.', 40, 485, 17, GO, { font: 'bold' });
+}
+
 mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
+        let fatalError = null;
+        let fatalStage = '';
 
-        // Common driving signals from SOME/IP
-        const car = new Car(ctx, ['rpm', 'speed', 'temps', 'torque', 'accel']);
-        car.setRedline(6500);
-
-        // Read-only diagnostic link for DME (0x12)
-        let diag = null;
         try {
-            diag = new ReadOnlyDiag(ctx.signals, log);
-            diag.init().catch((e) => log.warn('ReadOnlyDiag init: ' + e));
-        } catch (e) {
-            log.warn('ReadOnlyDiag creation error: ' + e);
-        }
+            // Common driving signals from SOME/IP
+            const car = new Car(ctx, ['rpm', 'speed', 'temps', 'torque', 'accel']);
+            car.setRedline(6500);
 
-        /* ---------------- State & Persistence ---------------- */
-        const STATE_FILE = path.join(ctx.dataDir, 'service_state.json');
-        let serviceState = null;
-
-        function loadServiceState() {
-            try {
-                fs.mkdirSync(ctx.dataDir, { recursive: true });
-                if (fs.existsSync(STATE_FILE)) {
-                    serviceState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+            // Read-only diagnostic link for DME (0x12) - delayed 2.0s to allow UI and TASU IPC sockets to settle
+            let diag = null;
+            setTimeout(() => {
+                try {
+                    diag = new ReadOnlyDiag(ctx.signals, log);
+                    diag.init()
+                        .then(() => log.info('ReadOnlyDiag connected to DME (0x12) successfully'))
+                        .catch((e) => log.warn('ReadOnlyDiag init warning: ' + e));
+                } catch (e) {
+                    log.warn('ReadOnlyDiag creation warning: ' + e);
                 }
-            } catch (e) {
-                log.warn('loadServiceState error: ' + e.message);
-            }
-            if (!serviceState || !Array.isArray(serviceState.intervals)) {
-                serviceState = JSON.parse(JSON.stringify(DEFAULT_SERVICE_STATE));
-                saveServiceState();
-            }
-        }
+            }, 2000);
 
-        function saveServiceState() {
-            try {
-                fs.mkdirSync(ctx.dataDir, { recursive: true });
-                const tmp = STATE_FILE + '.' + process.pid + '.tmp';
-                fs.writeFileSync(tmp, JSON.stringify(serviceState, null, 2), 'utf8');
-                fs.renameSync(tmp, STATE_FILE);
-            } catch (e) {
-                log.warn('saveServiceState error: ' + e.message);
-            }
-        }
+            /* ---------------- State & Persistence ---------------- */
+            const STATE_FILE = path.join(ctx.dataDir, 'service_state.json');
+            const BUNDLED_FILE = path.join(__dirname, 'data', 'service_state.json');
+            let serviceState = null;
 
-        loadServiceState();
+            function loadServiceState() {
+                try {
+                    fs.mkdirSync(ctx.dataDir, { recursive: true });
+                    if (fs.existsSync(STATE_FILE)) {
+                        serviceState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+                    } else if (fs.existsSync(BUNDLED_FILE)) {
+                        serviceState = JSON.parse(fs.readFileSync(BUNDLED_FILE, 'utf8'));
+                    }
+                } catch (e) {
+                    log.warn('loadServiceState error: ' + (e && e.message ? e.message : e));
+                }
+                if (!serviceState || !Array.isArray(serviceState.intervals)) {
+                    serviceState = JSON.parse(JSON.stringify(DEFAULT_SERVICE_STATE));
+                    saveServiceState();
+                }
+            }
+
+            function saveServiceState() {
+                try {
+                    fs.mkdirSync(ctx.dataDir, { recursive: true });
+                    const tmp = STATE_FILE + '.' + process.pid + '.tmp';
+                    fs.writeFileSync(tmp, JSON.stringify(serviceState, null, 2), 'utf8');
+                    fs.renameSync(tmp, STATE_FILE);
+                } catch (e) {
+                    log.warn('saveServiceState error: ' + (e && e.message ? e.message : e));
+                }
+            }
+
+            loadServiceState();
 
         /* ---------------- App Navigation & Tabs ---------------- */
         const TABS = ['XTRABOOST GUARD', 'WARMUP & TURBO', 'SERVICE TRACKER'];
@@ -352,91 +389,105 @@ mgu.run({
 
         /* ---------------- Main Render Function ---------------- */
         async function render() {
-            const t = ctx.theme();
-            const cv = ctx.canvas(W, H).clear(t.bg);
-            const d = car.data();
-            const now = Date.now();
-            const dt = Math.min(0.1, Math.max(0.001, (now - lastCooldownTick) / 1000));
-            lastCooldownTick = now;
-
-            const isDemo = (!diag || !diag.ready) || settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && d.demo);
-            if (isDemo) {
-                updateDemoState(d, dt);
+            if (fatalError) {
+                const cv = ctx.canvas(W, H);
+                drawCrashScreen(cv, ctx.theme(), fatalError, fatalStage);
+                return ui.image('MAIN_GFX', cv);
             }
+            try {
+                const t = ctx.theme();
+                const cv = ctx.canvas(W, H).clear(t.bg);
+                const d = car.data();
+                const now = Date.now();
+                const dt = Math.min(0.1, Math.max(0.001, (now - lastCooldownTick) / 1000));
+                lastCooldownTick = now;
 
-            const rpm = G.isNum(d.rpm) ? d.rpm : 0;
-            const iceTorque = G.isNum(d.torque) && d.torque > 0 ? d.torque : 0;
-            const iceKw = (iceTorque * rpm) / 9549;
-            const iceHp = iceKw * 1.35962;
-
-            const soc = G.isNum(liveDiag.soc) ? liveDiag.soc : 60;
-            let derateRatio = 1.0;
-            if (soc < 30) {
-                derateRatio = G.clamp(0.45 + (soc / 30) * 0.55, 0.45, 1.0);
-            }
-            liveDiag.derateRatio = derateRatio;
-
-            const evMaxHp = Math.round(SPEC.evMaxHp * derateRatio);
-            const evMaxNm = Math.round(SPEC.evMaxNm * derateRatio);
-            const lostHp = SPEC.evMaxHp - evMaxHp;
-            const lostNm = SPEC.evMaxNm - evMaxNm;
-
-            const accelPct = G.clamp((rpm / 4500) * (iceTorque / 350 || 0.5), 0, 1);
-            const evHp = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxHp * accelPct) : 0;
-            const evTorque = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxNm * accelPct) : 0;
-
-            const systemHp = Math.round(iceHp + evHp);
-
-            if (liveDiag.boostActual > 1.0 || (iceTorque > 350 && rpm > 3200)) {
-                liveDiag.wot = true;
-                liveDiag.peakBoost = Math.max(liveDiag.peakBoost, liveDiag.boostActual);
-                liveDiag.peakIat = Math.max(liveDiag.peakIat, liveDiag.iat);
-                for (let c = 0; c < 4; c++) {
-                    liveDiag.peakCorr[c] = Math.min(liveDiag.peakCorr[c], liveDiag.cylCorr[c]);
+                const isDemo = (!diag || !diag.ready) || settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && d.demo);
+                if (isDemo) {
+                    updateDemoState(d, dt);
                 }
-            }
 
-            const oilTemp = G.isNum(d.oil) ? d.oil : 88;
-            const coolantTemp = G.isNum(d.coolant) ? d.coolant : 92;
-            const isHardDriving = (liveDiag.boostActual > 1.0) || (rpm > 3900 && iceTorque > 300) || (oilTemp > 102);
+                const rpm = G.isNum(d.rpm) ? d.rpm : 0;
+                const iceTorque = G.isNum(d.torque) && d.torque > 0 ? d.torque : 0;
+                const iceKw = (iceTorque * rpm) / 9549;
+                const iceHp = iceKw * 1.35962;
 
-            if (isHardDriving) {
-                cooldownRemaining = settings.get('cooldownSec') || 90;
-            } else if (cooldownRemaining > 0) {
-                const isGentle = (rpm < 2200 && liveDiag.boostActual < 0.25);
-                if (isGentle) {
-                    cooldownRemaining = Math.max(0, cooldownRemaining - dt);
+                const soc = G.isNum(liveDiag.soc) ? liveDiag.soc : 60;
+                let derateRatio = 1.0;
+                if (soc < 30) {
+                    derateRatio = G.clamp(0.45 + (soc / 30) * 0.55, 0.45, 1.0);
                 }
+                liveDiag.derateRatio = derateRatio;
+
+                const evMaxHp = Math.round(SPEC.evMaxHp * derateRatio);
+                const evMaxNm = Math.round(SPEC.evMaxNm * derateRatio);
+                const lostHp = SPEC.evMaxHp - evMaxHp;
+                const lostNm = SPEC.evMaxNm - evMaxNm;
+
+                const accelPct = G.clamp((rpm / 4500) * (iceTorque / 350 || 0.5), 0, 1);
+                const evHp = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxHp * accelPct) : 0;
+                const evTorque = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxNm * accelPct) : 0;
+
+                const systemHp = Math.round(iceHp + evHp);
+
+                if (liveDiag.boostActual > 1.0 || (iceTorque > 350 && rpm > 3200)) {
+                    liveDiag.wot = true;
+                    liveDiag.peakBoost = Math.max(liveDiag.peakBoost, liveDiag.boostActual);
+                    liveDiag.peakIat = Math.max(liveDiag.peakIat, liveDiag.iat);
+                    for (let c = 0; c < 4; c++) {
+                        liveDiag.peakCorr[c] = Math.min(liveDiag.peakCorr[c], liveDiag.cylCorr[c]);
+                    }
+                }
+
+                const oilTemp = G.isNum(d.oil) ? d.oil : 88;
+                const coolantTemp = G.isNum(d.coolant) ? d.coolant : 92;
+                const isHardDriving = (liveDiag.boostActual > 1.0) || (rpm > 3900 && iceTorque > 300) || (oilTemp > 102);
+
+                if (isHardDriving) {
+                    cooldownRemaining = settings.get('cooldownSec') || 90;
+                } else if (cooldownRemaining > 0) {
+                    const isGentle = (rpm < 2200 && liveDiag.boostActual < 0.25);
+                    if (isGentle) {
+                        cooldownRemaining = Math.max(0, cooldownRemaining - dt);
+                    }
+                }
+
+                const oilOk = (oilTemp >= 85 && oilTemp <= 108);
+                const iatOk = (liveDiag.iat < 45);
+                const bmsOk = (derateRatio >= 0.98);
+                const ready100_200 = oilOk && iatOk && bmsOk;
+
+                const badges = [];
+                if (isDemo) badges.push({ text: 'DEMO', color: 'accent' });
+                if (cooldownRemaining > 0) badges.push({ text: 'COOLDOWN ' + Math.ceil(cooldownRemaining) + 's', color: 'warn' });
+                if (ready100_200) badges.push({ text: '420 KM READY', color: GO });
+
+                G.frame(cv, t, TABS, activeTab, badges);
+
+                if (activeTab === 0) {
+                    renderTab1_XtraBoostGuard(cv, t, {
+                        rpm, iceHp, iceTorque, evHp, evTorque, evMaxHp, evMaxNm,
+                        lostHp, lostNm, derateRatio, soc, systemHp, ready100_200,
+                        oilOk, iatOk, bmsOk, oilTemp
+                    });
+                } else if (activeTab === 1) {
+                    renderTab2_WarmupTurbo(cv, t, {
+                        oilTemp, coolantTemp, rpm, isHardDriving, cooldownRemaining
+                    });
+                } else if (activeTab === 2) {
+                    renderTab3_ServiceTracker(cv, t);
+                }
+
+                // CRITICAL: Hand drawn canvas to display/HMI so it renders on screen!
+                return ui.image('MAIN_GFX', cv);
+            } catch (renderErr) {
+                fatalError = renderErr;
+                fatalStage = 'PETLA RENDEROWANIA (RENDER LOOP)';
+                log.error('FATAL RENDER ERROR: ' + (renderErr && renderErr.stack || renderErr));
+                const cv = ctx.canvas(W, H);
+                drawCrashScreen(cv, ctx.theme(), fatalError, fatalStage);
+                return ui.image('MAIN_GFX', cv);
             }
-
-            const oilOk = (oilTemp >= 85 && oilTemp <= 108);
-            const iatOk = (liveDiag.iat < 45);
-            const bmsOk = (derateRatio >= 0.98);
-            const ready100_200 = oilOk && iatOk && bmsOk;
-
-            const badges = [];
-            if (isDemo) badges.push({ text: 'DEMO', color: 'accent' });
-            if (cooldownRemaining > 0) badges.push({ text: 'COOLDOWN ' + Math.ceil(cooldownRemaining) + 's', color: 'warn' });
-            if (ready100_200) badges.push({ text: '420 KM READY', color: GO });
-
-            G.frame(cv, t, TABS, activeTab, badges);
-
-            if (activeTab === 0) {
-                renderTab1_XtraBoostGuard(cv, t, {
-                    rpm, iceHp, iceTorque, evHp, evTorque, evMaxHp, evMaxNm,
-                    lostHp, lostNm, derateRatio, soc, systemHp, ready100_200,
-                    oilOk, iatOk, bmsOk, oilTemp
-                });
-            } else if (activeTab === 1) {
-                renderTab2_WarmupTurbo(cv, t, {
-                    oilTemp, coolantTemp, rpm, isHardDriving, cooldownRemaining
-                });
-            } else if (activeTab === 2) {
-                renderTab3_ServiceTracker(cv, t);
-            }
-
-            // CRITICAL: Hand drawn canvas to display/HMI so it renders on screen!
-            return ui.image('MAIN_GFX', cv);
         }
 
         // Paced at display vsync (60 fps) with GPU renderer; 6 fps software fallback
@@ -444,7 +495,14 @@ mgu.run({
 
         // Render first frame immediately at startup
         updateBarButtons();
-        render().then(() => log.info('first frame rendered successfully')).catch((e) => log.error('first render error', e));
+        render().then(() => log.info('first frame rendered successfully')).catch((e) => {
+            log.error('first render error', e);
+            fatalError = e;
+            fatalStage = 'PIERWSZA KLATKA (FIRST RENDER)';
+            const cv = ctx.canvas(W, H);
+            drawCrashScreen(cv, ctx.theme(), fatalError, fatalStage);
+            ui.image('MAIN_GFX', cv);
+        });
 
         /* =========================================================================
          * TAB 1: XTRABOOST GUARD (Dual Power Split, BMS Detector, 100-200, Fuel)
@@ -854,5 +912,17 @@ mgu.run({
             cv.text('Olej, filtr i swiece zuzywaja sie tylko wtedy,', rightX + 24, topY + 420, 17, t.dim);
             cv.text('gdy silnik B48 fizycznie pracuje. Prad nie zuzywa B48!', rightX + 24, topY + 444, 17, GO, { font: 'bold' });
         }
+    } catch (startErr) {
+        fatalError = startErr;
+        fatalStage = 'INICJALIZACJA (STARTUP)';
+        log.error('FATAL STARTUP CRASH: ' + (startErr && startErr.stack || startErr));
+        const emergencyRender = () => {
+            const cv = ctx.canvas(W, H);
+            drawCrashScreen(cv, ctx.theme(), fatalError, fatalStage);
+            return ui.image('MAIN_GFX', cv);
+        };
+        ctx.loop('MAIN', 2, emergencyRender);
+        emergencyRender().catch((e) => log.error('emergency render error: ' + e));
     }
+}
 });

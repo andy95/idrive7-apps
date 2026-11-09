@@ -1,0 +1,29 @@
+{
+  "baseOdo": 113000,
+  "lastOdo": 113000,
+  "totalIceKm": 0.0,
+  "totalEvKm": 0.0,
+  "intervals": [
+    {
+      "id": "oil",
+      "name": "Olej silnikowy (Millers 5W-40)",
+      "limitKm": 10500,
+      "currentKm": 0.0,
+      "spec": "5W-40 LL-04 (start: 0 km)"
+    },
+    {
+      "id": "air_filter",
+      "name": "Filtr powietrza",
+      "limitKm": 21000,
+      "currentKm": 2800.0,
+      "spec": "OEM B48 (start: 2800 km)"
+    },
+    {
+      "id": "spark_plugs",
+      "name": "Swiece zaplonowe NGK",
+      "limitKm": 35000,
+      "currentKm": 0.0,
+      "spec": "NGK Iridium (start: 0 km)"
+    }
+  ]
+}
