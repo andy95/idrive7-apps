@@ -105,9 +105,9 @@ mgu.run({
             let diag = null;
             setTimeout(() => {
                 try {
-                    diag = new ReadOnlyDiag(ctx.signals, log);
+                    diag = new ReadOnlyDiag(ctx.signals, log, { silentAfter: 30, gapMs: 25 });
                     diag.init()
-                        .then(() => log.info('ReadOnlyDiag connected to DME (0x12) successfully'))
+                        .then(() => log.info('ReadOnlyDiag connected to DME (0x12) & SME (0x07) successfully'))
                         .catch((e) => log.warn('ReadOnlyDiag init warning: ' + e));
                 } catch (e) {
                     log.warn('ReadOnlyDiag creation warning: ' + e);
@@ -263,6 +263,7 @@ mgu.run({
             if (diagBusy || !diag || !diag.ready) return;
             diagBusy = true;
             try {
+                if (diag.silent && diag.silent(0x12)) diag.wake(0x12);
                 const reply = await diag.readMany(0x12, DME_DIDS, 1000);
                 if (reply && reply[0] === 0x62) {
                     const parts = split(reply, DME_LENS);
@@ -304,34 +305,42 @@ mgu.run({
             }
         }
 
+        let smeStep = 0;
         async function pollSmeDiag() {
             if (diagBusy || !diag || !diag.ready) return;
             diagBusy = true;
             try {
-                const reply = await diag.readMany(0x07, SME_DIDS, 1000);
-                if (reply && reply[0] === 0x62) {
-                    const parts = split(reply, SME_LENS);
-                    if (parts) {
-                        if (parts[0xDD7D]) {
-                            const rawDischarge = (parts[0xDD7D][5] << 8) | parts[0xDD7D][6];
-                            const disA = rawDischarge * 0.1;
-                            if (disA > 10 && disA < 600) {
-                                liveDiag.dischargeLimitA = disA;
-                                liveDiag.bmsRealData = true;
-                            }
+                if (diag.silent && diag.silent(0x07)) diag.wake(0x07);
+                smeStep = (smeStep + 1) % 4;
+                if (smeStep === 1) {
+                    // Step 1: Read SME Discharge Limit (DID 0xDD7D - single DID read)
+                    const reply = await diag.read(0x07, 0xDD7D, 800);
+                    if (reply && reply[0] === 0x62 && reply.length >= 7) {
+                        const rawDischarge = (reply[5] << 8) | reply[6];
+                        const disA = rawDischarge * 0.1;
+                        if (disA > 10 && disA < 600) {
+                            liveDiag.dischargeLimitA = disA;
+                            liveDiag.bmsRealData = true;
                         }
-                        if (parts[0xDDB4]) {
-                            const rawV = (parts[0xDDB4][3] << 8) | parts[0xDDB4][4];
-                            const v = rawV * 0.01;
-                            if (v > 180 && v < 450) {
-                                liveDiag.hvVolts = v;
-                            }
+                    }
+                } else if (smeStep === 3) {
+                    // Step 3: Read SME Voltage (DID 0xDDB4 - single DID read)
+                    const reply = await diag.read(0x07, 0xDDB4, 800);
+                    if (reply && reply[0] === 0x62 && reply.length >= 5) {
+                        const rawV = (reply[3] << 8) | reply[4];
+                        const v = rawV * 0.01;
+                        if (v > 180 && v < 450) {
+                            liveDiag.hvVolts = v;
                         }
-                        if (parts[0xDD69]) {
-                            let rawA = (parts[0xDD69][3] << 24) | (parts[0xDD69][4] << 16) | (parts[0xDD69][5] << 8) | parts[0xDD69][6];
-                            const a = rawA * 0.01;
-                            liveDiag.hvAmps = Math.abs(a);
-                        }
+                    }
+                } else {
+                    // Steps 0 and 2: Read SME High Voltage Battery Current (DID 0xDD69 - single DID read)
+                    const reply = await diag.read(0x07, 0xDD69, 800);
+                    if (reply && reply[0] === 0x62 && reply.length >= 7) {
+                        const rawA = Buffer.from(reply).readInt32BE(3);
+                        const a = rawA * 0.01;
+                        // On BMW SME: negative = discharge (to electric motor), positive = charge / regen
+                        liveDiag.hvAmps = a;
                     }
                 }
             } catch (err) {
@@ -343,15 +352,15 @@ mgu.run({
 
         let diagStep = 0;
         setInterval(() => {
-            if (activeTab === 0 && diag && diag.ready) {
-                diagStep = (diagStep + 1) % 3;
+            if (diag && diag.ready) {
+                diagStep = (diagStep + 1) % 4;
                 if (diagStep === 0) {
                     pollSmeDiag();
                 } else {
                     pollDmeDiag();
                 }
             }
-        }, 200);
+        }, 150);
 
         /* ---------------- Tab 2: Warmup & Turbo Cooldown Tracking ---------------- */
         let cooldownRemaining = 0;
@@ -392,9 +401,9 @@ mgu.run({
             liveDiag.hvVolts = 352.0;
             liveDiag.bmsRealData = true;
             if (isHardAcc) {
-                liveDiag.hvAmps = 220.0;
+                liveDiag.hvAmps = -210.0;
             } else {
-                liveDiag.hvAmps = 15.0;
+                liveDiag.hvAmps = -15.0;
             }
 
             demoOdoAccumulator += (d.speed || 60) * (dt / 3600);
@@ -441,6 +450,13 @@ mgu.run({
                 if (v && G.isNum(v.actualValueStateOfCharge)) {
                     liveDiag.soc = v.actualValueStateOfCharge;
                 }
+                if (v && G.isNum(v.actualValueVoltageHighVoltageStorage)) {
+                    const rawV = v.actualValueVoltageHighVoltageStorage;
+                    const volts = rawV > 1500 ? rawV / 10 : rawV;
+                    if (volts > 180 && volts < 500) {
+                        liveDiag.hvVolts = volts;
+                    }
+                }
             }
         }, log).catch((e) => log.warn('LSCDataSink watch: ' + e));
 
@@ -465,9 +481,8 @@ mgu.run({
                 }
 
                 const rpm = G.isNum(d.rpm) ? d.rpm : 0;
-                const iceTorque = G.isNum(d.torque) && d.torque > 0 ? d.torque : 0;
-                const iceKw = (iceTorque * rpm) / 9549;
-                const iceHp = iceKw * 1.35962;
+                const totalTorque = (G.isNum(d.torque) && d.torque > 0) ? d.torque : 0;
+                const isIceRunning = (rpm >= 500);
 
                 // 2. Real BMS derating calculation from SME battery limits (NO hardcoded 30% rule!)
                 const soc = G.isNum(liveDiag.soc) ? liveDiag.soc : 60;
@@ -484,7 +499,7 @@ mgu.run({
                     }
                 } else {
                     // Fallback when SME is still connecting or idle:
-                    // We only assume mild derating when SoC is genuinely depleted (< 15%)
+                    // Only derate when SoC is genuinely low (< 15%)
                     if (soc < 15) {
                         derateRatio = G.clamp(0.40 + (soc / 15) * 0.60, 0.40, 1.0);
                     } else {
@@ -498,25 +513,61 @@ mgu.run({
                 const lostHp = SPEC.evMaxHp - evMaxHp;
                 const lostNm = SPEC.evMaxNm - evMaxNm;
 
-                // 3. Real Electric Motor Power and Torque from HV battery current
-                let evHp = 0;
-                let evTorque = 0;
-                if (liveDiag.hvAmps > 2.5 && liveDiag.hvVolts > 180) {
-                    // Real electrical power flowing from battery to motor (inverter + e-motor efficiency ~91%)
-                    const realEvKw = (liveDiag.hvVolts * liveDiag.hvAmps * 0.91) / 1000;
-                    evHp = G.clamp(realEvKw * 1.35962, 0, evMaxHp);
-                    if (rpm > 200) {
-                        evTorque = G.clamp((realEvKw * 9549) / rpm, 0, evMaxNm);
+                // 3. Real Electric Motor Power and Torque from HV battery current & Powertrain Split
+                let iceHp = 0, iceTorque = 0, evHp = 0, evTorque = 0;
+                const dischargeAmps = Math.max(0, -liveDiag.hvAmps);
+                // Auxiliary baseline load (12V DC/DC converter + A/C inverter consumes ~3.5A / ~1.2 kW)
+                const isStationary = ((d.speed || 0) < 2 && totalTorque < 15);
+                const tractionAmps = isStationary ? 0 : Math.max(0, dischargeAmps - 3.5);
+
+                if (!isIceRunning) {
+                    // STATE 1: EV Mode (B48 engine OFF, 0 RPM) -> 100% torque and power from EV
+                    iceHp = 0;
+                    iceTorque = 0;
+                    if (isStationary) {
+                        evTorque = 0;
+                        evHp = 0;
                     } else {
-                        evTorque = G.clamp((evHp / (SPEC.evMaxHp || 1)) * SPEC.evMaxNm, 0, evMaxNm);
+                        evTorque = G.clamp(totalTorque, 0, evMaxNm);
+                        if (tractionAmps > 3.0 && liveDiag.hvVolts > 180) {
+                            const kw = (liveDiag.hvVolts * tractionAmps * 0.91) / 1000;
+                            evHp = G.clamp(kw * 1.35962, 0, evMaxHp);
+                        } else {
+                            const transRpm = Math.max(1000, Math.min(3600, (d.speed || 15) * 35));
+                            const kw = (evTorque * transRpm) / 9549;
+                            evHp = G.clamp(kw * 1.35962, 0, evMaxHp);
+                        }
                     }
                 } else {
-                    // Dynamic demand estimation when current sensor is settling
-                    const accelPct = G.clamp((rpm / 4500) * (iceTorque / 350 || 0.5), 0, 1);
-                    evHp = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxHp * accelPct) : 0;
-                    evTorque = (rpm > 100 || (d.speed || 0) > 0) ? (evMaxNm * accelPct) : 0;
+                    // STATE 2 & 3: B48 Engine Running (RPM >= 500)
+                    const isHardAcc = (liveDiag.boostActual > 0.5) || ((d.accel || 0) > 0.3) || (totalTorque > 350);
+                    if (tractionAmps > 8.0 && liveDiag.hvVolts > 180) {
+                        const kw = (liveDiag.hvVolts * tractionAmps * 0.91) / 1000;
+                        evHp = G.clamp(kw * 1.35962, 0, evMaxHp);
+                        evTorque = G.clamp((evHp / (SPEC.evMaxHp || 1)) * evMaxNm, 0, evMaxNm);
+                        iceTorque = G.clamp(totalTorque - evTorque, 0, SPEC.iceMaxNm);
+                        iceHp = ((iceTorque * rpm) / 9549) * 1.35962;
+                    } else if (isHardAcc) {
+                        // WOT / Kickdown / XtraBoost boost assist
+                        const boostRatio = G.clamp((liveDiag.boostActual - 0.4) / 1.0, 0.4, 1.0);
+                        evHp = Math.round(evMaxHp * boostRatio);
+                        evTorque = Math.round(evMaxNm * boostRatio);
+                        iceTorque = G.clamp(totalTorque - evTorque, 0, SPEC.iceMaxNm);
+                        if (iceTorque < 120 && totalTorque > 200) iceTorque = Math.min(SPEC.iceMaxNm, totalTorque);
+                        iceHp = ((iceTorque * rpm) / 9549) * 1.35962;
+                    } else {
+                        // Cruising on ICE only
+                        iceTorque = Math.min(SPEC.iceMaxNm, totalTorque);
+                        iceHp = ((iceTorque * rpm) / 9549) * 1.35962;
+                        evTorque = 0;
+                        evHp = 0;
+                    }
                 }
 
+                iceHp = Math.round(G.clamp(iceHp, 0, SPEC.iceMaxHp));
+                iceTorque = Math.round(G.clamp(iceTorque, 0, SPEC.iceMaxNm));
+                evHp = Math.round(G.clamp(evHp, 0, evMaxHp));
+                evTorque = Math.round(G.clamp(evTorque, 0, evMaxNm));
                 const systemHp = Math.round(iceHp + evHp);
 
                 if (liveDiag.boostActual > 1.0 || (iceTorque > 350 && rpm > 3200)) {
