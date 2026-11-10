@@ -5,6 +5,7 @@
   "version": "1.0.0",
   "vendor": "custom",
   "loggingId": "OA9E",
+  "mguHmi": ["ID7"],
   "iconGlyph": "gauge",
   "signals": {
     "com.harman.infotainment.systemfunctions.tasu.tasu.InternalTasu": {
