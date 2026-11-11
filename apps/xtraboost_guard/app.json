@@ -1,8 +1,8 @@
 {
   "id": "xtraboost_guard",
   "title": "XtraBoost Guard",
-  "description": "Gotowosc bojowa 420 KM, ochrona zimnego B48 i licznik serwisu PHEV dla BMW G30 530e Stage 1",
-  "version": "1.1.0",
+  "description": "Gotowosc bojowa 420 KM, wykres korekt zaplonu i stukowego DME, 60s peak hold i ochrona B48 dla BMW G30 530e",
+  "version": "1.2.0",
   "vendor": "custom",
   "loggingId": "OA9E",
   "mguHmi": ["ID7"],
@@ -133,6 +133,14 @@
       "unit": "°",
       "default": -3.0,
       "steps": [-1.5, -2.0, -2.5, -3.0, -3.5, -4.0]
+    },
+    {
+      "key": "peakHoldSec",
+      "label": "Peak Hold Duration",
+      "type": "number",
+      "unit": "s",
+      "default": 60,
+      "steps": [15, 30, 45, 60, 90, 120]
     }
   ]
 }

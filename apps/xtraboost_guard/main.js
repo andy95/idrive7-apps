@@ -172,30 +172,32 @@ mgu.run({
             loadServiceState();
 
         /* ---------------- App Navigation & Tabs ---------------- */
-        const TABS = ['XTRABOOST GUARD', 'WARMUP & TURBO', 'SERVICE TRACKER'];
+        const TABS = ['XTRABOOST GUARD', 'WYKRES & LOGI', 'WARMUP & TURBO', 'SERVICE TRACKER'];
         let activeTab = 0;
         let selectedServiceIdx = 0;
         let serviceConfirmUntil = 0;
 
         function updateBarButtons() {
             if (activeTab === 0) {
-                ui.text('BTN_ACTION', 'Reset Peak');
+                ui.text('BTN_ACTION', 'Reset Peak (60s)');
             } else if (activeTab === 1) {
-                ui.text('BTN_ACTION', 'Kasuj Cooldown');
+                ui.text('BTN_ACTION', 'Resetuj Wykres');
             } else if (activeTab === 2) {
+                ui.text('BTN_ACTION', 'Kasuj Cooldown');
+            } else if (activeTab === 3) {
                 const isArmed = Date.now() < serviceConfirmUntil;
                 const it = serviceState.intervals[selectedServiceIdx];
                 ui.text('BTN_ACTION', isArmed ? 'POTWIERDZ RESET!' : 'Resetuj: ' + (it ? it.id : 'CBS'));
             }
         }
 
-        const flipNext = () => { activeTab = (activeTab + 1) % 3; serviceConfirmUntil = 0; updateBarButtons(); render(); };
-        const flipPrev = () => { activeTab = (activeTab + 2) % 3; serviceConfirmUntil = 0; updateBarButtons(); render(); };
+        const flipNext = () => { activeTab = (activeTab + 1) % 4; serviceConfirmUntil = 0; updateBarButtons(); render(); };
+        const flipPrev = () => { activeTab = (activeTab + 3) % 4; serviceConfirmUntil = 0; updateBarButtons(); render(); };
 
         ui.onClick('BTN_PAGE', flipNext);
         ui.onClick('BTN_PREV', flipPrev);
         ctx.onTab((i) => {
-            if (i >= 0 && i < 3 && i !== activeTab) {
+            if (i >= 0 && i < 4 && i !== activeTab) {
                 activeTab = i;
                 serviceConfirmUntil = 0;
                 updateBarButtons();
@@ -205,7 +207,7 @@ mgu.run({
 
         // Touch support on screen
         ctx.onTap((x, y) => {
-            if (activeTab === 2) {
+            if (activeTab === 3) {
                 // Tapping on service item rows to select them
                 const itemY0 = 46 + 86;
                 const itemH = 104;
@@ -228,9 +230,12 @@ mgu.run({
                 resetPeaks();
                 render();
             } else if (activeTab === 1) {
-                cooldownRemaining = 0;
+                resetLogs();
                 render();
             } else if (activeTab === 2) {
+                cooldownRemaining = 0;
+                render();
+            } else if (activeTab === 3) {
                 const now = Date.now();
                 if (now < serviceConfirmUntil) {
                     const it = serviceState.intervals[selectedServiceIdx];
@@ -268,11 +273,96 @@ mgu.run({
             wot: false
         };
 
+        /* ---------------- Peak Hold Engine (60s Retention for Power & Torque) ---------------- */
+        const peakHold = {
+            systemHp: 0,
+            systemHpTime: 0,
+            systemTorque: 0,
+            systemTorqueTime: 0,
+            iceHp: 0,
+            iceHpTime: 0,
+            iceTorque: 0,
+            iceTorqueTime: 0,
+            evHp: 0,
+            evHpTime: 0,
+            evTorque: 0,
+            evTorqueTime: 0,
+            boost: 0,
+            boostTime: 0,
+            get holdMs() {
+                const s = settings.get('peakHoldSec');
+                return (G.isNum(s) && s > 0 ? s : 60) * 1000;
+            }
+        };
+
         function resetPeaks() {
+            const now = Date.now();
+            peakHold.systemHp = 0;
+            peakHold.systemHpTime = now;
+            peakHold.systemTorque = 0;
+            peakHold.systemTorqueTime = now;
+            peakHold.iceHp = 0;
+            peakHold.iceHpTime = now;
+            peakHold.iceTorque = 0;
+            peakHold.iceTorqueTime = now;
+            peakHold.evHp = 0;
+            peakHold.evHpTime = now;
+            peakHold.evTorque = 0;
+            peakHold.evTorqueTime = now;
+            peakHold.boost = 0;
+            peakHold.boostTime = now;
+
             liveDiag.peakBoost = liveDiag.boostActual;
             liveDiag.peakIat = liveDiag.iat;
             liveDiag.peakCorr = [0.0, 0.0, 0.0, 0.0];
             log.info('Peaks reset');
+        }
+
+        function updatePeak(currentVal, peakKey, timeKey, now) {
+            if (now - peakHold[timeKey] > peakHold.holdMs) {
+                peakHold[peakKey] = currentVal;
+                peakHold[timeKey] = now;
+            } else if (currentVal >= peakHold[peakKey]) {
+                peakHold[peakKey] = currentVal;
+                peakHold[timeKey] = now;
+            }
+        }
+
+        function peakRemainingSec(timeKey, now) {
+            return Math.max(0, Math.ceil((peakHold.holdMs - (now - peakHold[timeKey])) / 1000));
+        }
+
+        /* ---------------- Tab 2: RPM Knock & Power Logging Engine ---------------- */
+        const RPM_MIN = 1500;
+        const RPM_MAX = 6800;
+        const RPM_STEP = 100;
+        const NUM_BINS = Math.floor((RPM_MAX - RPM_MIN) / RPM_STEP) + 1; // 54 bins
+
+        const rpmBins = [];
+        for (let i = 0; i < NUM_BINS; i++) {
+            rpmBins.push({
+                rpm: RPM_MIN + i * RPM_STEP,
+                worstCorr: 0.0,
+                worstCyl: 0,
+                cylCorrs: [0.0, 0.0, 0.0, 0.0],
+                maxHp: 0,
+                maxIceHp: 0,
+                maxBoost: 0,
+                samples: 0
+            });
+        }
+
+        function resetLogs() {
+            for (let i = 0; i < NUM_BINS; i++) {
+                rpmBins[i].worstCorr = 0.0;
+                rpmBins[i].worstCyl = 0;
+                rpmBins[i].cylCorrs = [0.0, 0.0, 0.0, 0.0];
+                rpmBins[i].maxHp = 0;
+                rpmBins[i].maxIceHp = 0;
+                rpmBins[i].maxBoost = 0;
+                rpmBins[i].samples = 0;
+            }
+            log.info('Knock logs and RPM chart reset');
         }
 
         const DME_DIDS = [0x4205, 0x4AB0, 0x580F, 0x59FA, 0x4A49, 0x4A4A, 0x4A4C, 0x4A4D];
@@ -437,6 +527,27 @@ mgu.run({
             liveDiag.bmsRealData = true;
             if (isHardAcc) {
                 liveDiag.hvAmps = -210.0;
+                const simRpm = Math.round(2000 + 4400 * (0.5 + 0.5 * Math.sin(demoPhase * 1.5)));
+                const bIdx = Math.round((simRpm - RPM_MIN) / RPM_STEP);
+                if (bIdx >= 0 && bIdx < NUM_BINS) {
+                    const db = rpmBins[bIdx];
+                    db.samples++;
+                    const curveRatio = Math.sin(((simRpm - 1500) / (6500 - 1500)) * Math.PI * 0.85);
+                    db.maxHp = Math.max(db.maxHp, Math.round(210 + 205 * curveRatio));
+                    db.maxBoost = Math.max(db.maxBoost, 1.48);
+                    if (simRpm >= 4900 && simRpm <= 5250) {
+                        db.cylCorrs[2] = -3.4;
+                        db.worstCorr = -3.4;
+                        db.worstCyl = 3;
+                    } else if (simRpm > 5250) {
+                        db.cylCorrs[1] = -1.2;
+                        db.worstCorr = -1.2;
+                        db.worstCyl = 2;
+                    } else {
+                        db.worstCorr = -0.4;
+                        db.worstCyl = 1;
+                    }
+                }
             } else {
                 liveDiag.hvAmps = -15.0;
             }
@@ -619,6 +730,42 @@ mgu.run({
                 evHp = Math.round(G.clamp(evHp, 0, evMaxHp));
                 evTorque = Math.round(G.clamp(evTorque, 0, evMaxNm));
                 const systemHp = Math.round(iceHp + evHp);
+                const systemTorque = Math.round(iceTorque + evTorque);
+
+                // 60-Second Peak Hold updates
+                updatePeak(systemHp, 'systemHp', 'systemHpTime', now);
+                updatePeak(systemTorque, 'systemTorque', 'systemTorqueTime', now);
+                updatePeak(iceHp, 'iceHp', 'iceHpTime', now);
+                updatePeak(iceTorque, 'iceTorque', 'iceTorqueTime', now);
+                updatePeak(evHp, 'evHp', 'evHpTime', now);
+                updatePeak(evTorque, 'evTorque', 'evTorqueTime', now);
+                updatePeak(liveDiag.boostActual, 'boost', 'boostTime', now);
+
+                // Feed RPM Knock & Power Logger during acceleration / positive load
+                if (rpm >= RPM_MIN && rpm <= RPM_MAX && isIceRunning) {
+                    const isUnderLoad = (totalTorque > 100 || liveDiag.boostActual > 0.25 || liveDiag.wot);
+                    if (isUnderLoad) {
+                        const binIdx = Math.round((rpm - RPM_MIN) / RPM_STEP);
+                        if (binIdx >= 0 && binIdx < NUM_BINS) {
+                            const b = rpmBins[binIdx];
+                            b.samples++;
+                            b.maxHp = Math.max(b.maxHp, systemHp);
+                            b.maxIceHp = Math.max(b.maxIceHp, iceHp);
+                            b.maxBoost = Math.max(b.maxBoost, liveDiag.boostActual);
+
+                            for (let c = 0; c < 4; c++) {
+                                const corr = liveDiag.cylCorr[c];
+                                if (corr < b.cylCorrs[c]) {
+                                    b.cylCorrs[c] = corr;
+                                }
+                                if (corr < b.worstCorr) {
+                                    b.worstCorr = corr;
+                                    b.worstCyl = c + 1;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if (liveDiag.boostActual > 1.0 || (iceTorque > 350 && rpm > 3200)) {
                     liveDiag.wot = true;
@@ -661,15 +808,19 @@ mgu.run({
                 if (activeTab === 0) {
                     renderTab1_XtraBoostGuard(cv, t, {
                         rpm, iceHp, iceTorque, evHp, evTorque, evMaxHp, evMaxNm,
-                        lostHp, lostNm, derateRatio, soc, hasRealSoc, maxSystemHp, systemHp, ready100_200,
-                        oilOk, iatOk, bmsOk, oilTemp
+                        lostHp, lostNm, derateRatio, soc, hasRealSoc, maxSystemHp, systemHp, systemTorque,
+                        ready100_200, oilOk, iatOk, bmsOk, oilTemp, now
                     });
                 } else if (activeTab === 1) {
-                    renderTab2_WarmupTurbo(cv, t, {
-                        oilTemp, coolantTemp, rpm, isHardDriving, cooldownRemaining
+                    renderTab2_LogiWykres(cv, t, {
+                        rpm, systemHp, iceHp, systemTorque, oilTemp, coolantTemp, now
                     });
                 } else if (activeTab === 2) {
-                    renderTab3_ServiceTracker(cv, t);
+                    renderTab3_WarmupTurbo(cv, t, {
+                        oilTemp, coolantTemp, rpm, isHardDriving, cooldownRemaining
+                    });
+                } else if (activeTab === 3) {
+                    renderTab4_ServiceTracker(cv, t);
                 }
 
                 // CRITICAL: Hand drawn canvas to display/HMI so it renders on screen!
@@ -708,7 +859,8 @@ mgu.run({
 
             G.panel(cv, t, 16, topY, colW, h, 'MOC SILNIKOW (DUAL POWER SPLIT)');
 
-            cv.text('SILNIK B48 (SPALINOWY - STAGE 1)', 36, topY + 68, 20, t.text, { font: 'bold' });
+            const icePeakRem = peakRemainingSec('iceHpTime', p.now);
+            cv.text('SILNIK B48 (STAGE 1) | PEAK (60s): ' + peakHold.iceHp + ' KM / ' + peakHold.iceTorque + ' Nm (' + icePeakRem + 's)', 36, topY + 68, 18, t.text, { font: 'bold' });
             G.bar(cv, t, 36, topY + 76, colW - 40, 60, {
                 label: 'MOC B48',
                 unit: 'KM',
@@ -717,7 +869,7 @@ mgu.run({
                 max: 340,
                 decimals: 0,
                 color: BLUE,
-                peak: Math.max(p.iceHp, SPEC.iceMaxHp * 0.95),
+                peak: peakHold.iceHp,
                 zones: [{ from: 300, to: 340, color: CRIT }]
             });
 
@@ -729,13 +881,14 @@ mgu.run({
                 max: 500,
                 decimals: 0,
                 color: BLUE,
-                peak: Math.max(p.iceTorque, SPEC.iceMaxNm * 0.95),
+                peak: peakHold.iceTorque,
                 zones: [{ from: 430, to: 500, color: CRIT }]
             });
 
             cv.fillRect(36, topY + 236, colW - 40, 1, withAlpha('#ffffff', 0.12));
             const socTxt = p.hasRealSoc ? (p.soc.toFixed(1) + '% SoC') : 'Odczyt...';
-            cv.text('SILNIK ELEKTRYCZNY (EME) | ' + socTxt, 36, topY + 264, 19, p.derateRatio < 0.98 ? WARN : M_CYAN, { font: 'bold' });
+            const evPeakRem = peakRemainingSec('evHpTime', p.now);
+            cv.text('SILNIK ELEKTRYCZNY (EME) | PEAK: ' + peakHold.evHp + ' KM / ' + peakHold.evTorque + ' Nm (' + evPeakRem + 's)', 36, topY + 264, 18, p.derateRatio < 0.98 ? WARN : M_CYAN, { font: 'bold' });
 
             G.bar(cv, t, 36, topY + 272, colW - 40, 60, {
                 label: 'MOC ELEKTRYCZNA',
@@ -745,7 +898,7 @@ mgu.run({
                 max: 120,
                 decimals: 0,
                 color: p.derateRatio < 0.98 ? WARN : M_CYAN,
-                peak: p.evMaxHp
+                peak: peakHold.evHp
             });
 
             G.bar(cv, t, 36, topY + 350, colW - 40, 60, {
@@ -756,7 +909,7 @@ mgu.run({
                 max: 300,
                 decimals: 0,
                 color: p.derateRatio < 0.98 ? WARN : M_CYAN,
-                peak: p.evMaxNm
+                peak: peakHold.evTorque
             });
 
             const bmsCardY = topY + 414;
@@ -789,14 +942,23 @@ mgu.run({
                 min: 0,
                 max: 450,
                 color: GO,
+                peak: peakHold.systemHp,
                 zones: [{ from: 410, to: 450, color: GO }]
             });
+
+            // 60-Second Peak Hold Banner in Center Panel
+            const sysPeakRem = peakRemainingSec('systemHpTime', p.now);
+            cv.roundRect(midX + 30, topY + 205, midW - 60, 32, 6, withAlpha('#ffffff', 0.08));
+            cv.strokeRoundRect(midX + 30, topY + 205, midW - 60, 32, 6, 1, withAlpha(GO, 0.45));
+            cv.text('SZCZYT (PEAK 60s): ' + peakHold.systemHp + ' KM  |  ' + peakHold.systemTorque + ' Nm', midX + midW / 2 - 25, topY + 227, 18, GO, { align: 'center', font: 'bold' });
+            cv.text(sysPeakRem + 's', midX + midW - 44, topY + 227, 16, t.dim, { align: 'right', font: 'num' });
 
             // Prominent Max Available System Power indicator
             const capTxt = (p.derateRatio < 0.98)
                 ? 'MAKS. MOC TERAZ: ' + p.maxSystemHp + ' KM (B48: 311 KM + EME: ' + p.evMaxHp + ' KM)'
                 : 'MAKS. MOC TERAZ: 420 KM (PELNY XTRABOOST ODBLOKOWANY)';
             const capCol = (p.derateRatio < 0.98) ? WARN : GO;
+            cv.text(capTxt, midX + midW / 2, topY + 256, 17, capCol, { align: 'center', font: 'bold' });
             cv.text(capTxt, midX + midW / 2, topY + 224, 18, capCol, { align: 'center', font: 'bold' });
 
             cv.fillRect(midX + 30, topY + 236, midW - 60, 1, withAlpha('#ffffff', 0.12));
@@ -906,9 +1068,244 @@ mgu.run({
         }
 
         /* =========================================================================
-         * TAB 2: WARMUP & TURBO (Ochrona Zimnego B48, Dynamiczny Limit, Cooldown)
+         * TAB 2: LOGI & WYKRES (Korekty Zaplonu DME vs RPM, Moc Pull, Detekcja Stukowego)
          * ========================================================================= */
-        function renderTab2_WarmupTurbo(cv, t, p) {
+        function renderTab2_LogiWykres(cv, t, p) {
+            const topY = 46;
+            const h = 466;
+
+            // --- PANEL LEWY: GLOWNY WYKRES KOREKT I MOCY VS RPM ---
+            const leftW = 1040;
+            G.panel(cv, t, 16, topY, leftW, h, 'WYKRES PULLA: KOREKTY ZAPLONU (DME) & MOC SYSTEMOWA VS RPM');
+
+            // Find global stats from rpmBins
+            let worstRetard = 0.0;
+            let worstRetardRpm = 0;
+            let worstRetardCyl = 0;
+            let worstRetardHp = 0;
+            let worstRetardBoost = 0;
+            let peakPullHp = 0;
+            let peakPullHpRpm = 0;
+            let totalSamples = 0;
+
+            rpmBins.forEach((b) => {
+                totalSamples += b.samples;
+                if (b.worstCorr < worstRetard) {
+                    worstRetard = b.worstCorr;
+                    worstRetardRpm = b.rpm;
+                    worstRetardCyl = b.worstCyl;
+                    worstRetardHp = b.maxHp;
+                    worstRetardBoost = b.maxBoost;
+                }
+                if (b.maxHp > peakPullHp) {
+                    peakPullHp = b.maxHp;
+                    peakPullHpRpm = b.rpm;
+                }
+            });
+
+            // Legend bar at top of graph
+            const legY = topY + 68;
+            cv.fillRect(36, legY - 14, 18, 4, GO);
+            cv.text('MOC SYSTEMOWA (KM)', 60, legY - 8, 17, GO, { font: 'bold' });
+
+            cv.fillRect(270, legY - 14, 16, 12, CRIT);
+            cv.text('KOREKTY ZAPLONU (°CA)', 294, legY - 8, 17, CRIT, { font: 'bold' });
+
+            cv.fillRect(520, legY - 12, 24, 2, withAlpha(CRIT, 0.7));
+            cv.text('PROG STUKOWEGO (-3.0°)', 552, legY - 8, 17, withAlpha(CRIT, 0.9), { font: 'bold' });
+
+            cv.text('SZCZYT PULLA: ' + (peakPullHp > 0 ? (peakPullHp + ' KM @ ' + peakPullHpRpm + ' RPM') : 'Brak danych'), leftW - 24, legY - 8, 18, t.text, { align: 'right', font: 'num' });
+
+            // Graph geometry
+            const gx = 86;
+            const gy = topY + 80;
+            const gw = leftW - 140; // 900 px
+            const gh = 310;
+
+            const X = (r) => gx + G.clamp((r - RPM_MIN) / (RPM_MAX - RPM_MIN), 0, 1) * gw;
+            const Y_HP = (hp) => gy + gh - G.clamp(hp / 450, 0, 1) * gh;
+            // Timing retard scale: 0.0° at gy + 35, -5.0° at gy + gh - 15
+            const Y_CORR = (c) => gy + 35 + G.clamp((-c) / 5.0, 0, 1) * (gh - 50);
+
+            // Background plot area
+            cv.fillRect(gx, gy, gw, gh, withAlpha('#000000', 0.25));
+            cv.strokeRoundRect(gx, gy, gw, gh, 4, 1, withAlpha('#ffffff', 0.15));
+
+            // Grid lines - RPM (Vertical)
+            [2000, 3000, 4000, 5000, 6000, 6500].forEach((r) => {
+                const rx = X(r);
+                cv.fillRect(rx, gy, 1, gh, withAlpha('#ffffff', 0.10));
+                cv.text(String(r), rx, gy + gh + 22, 17, t.dim, { align: 'center', font: 'num' });
+            });
+            cv.text('OBROTY SILNIKA (RPM)', gx + gw / 2, gy + gh + 44, 16, t.dim, { align: 'center', font: 'bold', spacing: 1.5 });
+
+            // Grid lines - Power (Horizontal, right axis labels)
+            [100, 200, 300, 400].forEach((hp) => {
+                const hy = Y_HP(hp);
+                cv.fillRect(gx, hy, gw, 1, withAlpha('#ffffff', 0.08));
+                cv.text(hp + ' KM', gx + gw + 8, hy + 6, 16, withAlpha(GO, 0.7), { font: 'num' });
+            });
+
+            // Grid lines - Knock Retard (Horizontal, left axis labels)
+            const corr0Y = Y_CORR(0.0);
+            cv.fillRect(gx, corr0Y, gw, 1.5, withAlpha('#ffffff', 0.3));
+            cv.text('0.0°', gx - 8, corr0Y + 6, 17, t.dim, { align: 'right', font: 'num' });
+
+            const corr15Y = Y_CORR(-1.5);
+            cv.fillRect(gx, corr15Y, gw, 1, withAlpha(WARN, 0.25));
+            cv.text('-1.5°', gx - 8, corr15Y + 6, 16, WARN, { align: 'right', font: 'num' });
+
+            const thresh = settings.get('knockThreshold') || -3.0;
+            const corrThreshY = Y_CORR(thresh);
+            // Prominent red dashed/line for knock threshold
+            cv.fillRect(gx, corrThreshY, gw, 2, withAlpha(CRIT, 0.6));
+            cv.text(thresh.toFixed(1) + '° STUK', gx - 8, corrThreshY + 6, 16, CRIT, { align: 'right', font: 'bold' });
+
+            // 1. Draw Power Curve Polyline & Fill
+            const hpPts = [];
+            rpmBins.forEach((b) => {
+                if (b.samples > 0 && b.maxHp > 30) {
+                    hpPts.push([X(b.rpm), Y_HP(b.maxHp)]);
+                }
+            });
+            if (hpPts.length > 1) {
+                cv.fillUnder(hpPts, gy + gh, withAlpha(GO, 0.12));
+                cv.polyline(hpPts, 3, GO);
+
+                if (peakPullHp > 50) {
+                    const pkX = X(peakPullHpRpm);
+                    const pkY = Y_HP(peakPullHp);
+                    cv.circle(pkX, pkY, 6, GO);
+                    cv.circle(pkX, pkY, 3, '#ffffff');
+                    cv.text(peakPullHp + ' KM', pkX, pkY - 10, 16, GO, { align: 'center', font: 'bold' });
+                }
+            }
+
+            // 2. Draw Knock Retard Bars down from 0.0° line
+            rpmBins.forEach((b) => {
+                if (b.samples > 0 && b.worstCorr < -0.15) {
+                    const bx = X(b.rpm);
+                    const by = Y_CORR(b.worstCorr);
+                    const barH = Math.max(3, by - corr0Y);
+                    let barCol = M_CYAN;
+                    if (b.worstCorr <= thresh) barCol = CRIT;
+                    else if (b.worstCorr <= -1.5) barCol = WARN;
+
+                    cv.roundRect(bx - 5, corr0Y, 10, barH, 2, barCol);
+
+                    if (b.worstCorr <= thresh) {
+                        cv.text('C' + b.worstCyl + ':' + b.worstCorr.toFixed(1) + '°', bx, by + 16, 13, CRIT, { align: 'center', font: 'bold' });
+                    }
+                }
+            });
+
+            // 3. Connect worst corrections with polyline
+            const corrPts = [];
+            rpmBins.forEach((b) => {
+                if (b.samples > 0) {
+                    corrPts.push([X(b.rpm), Y_CORR(b.worstCorr)]);
+                }
+            });
+            if (corrPts.length > 1) {
+                cv.polyline(corrPts, 2, withAlpha(CRIT, 0.8));
+            }
+
+            // 4. Live RPM Cursor (if engine running)
+            if (p.rpm >= RPM_MIN && p.rpm <= RPM_MAX) {
+                const lx = X(p.rpm);
+                cv.fillRect(lx, gy, 2, gh, withAlpha(BLUE, 0.8));
+                cv.circle(lx, gy + gh, 5, BLUE);
+                cv.text(p.rpm + ' RPM', lx, gy - 6, 16, BLUE, { align: 'center', font: 'bold' });
+            }
+
+            if (totalSamples === 0) {
+                cv.roundRect(gx + gw / 4, gy + gh / 3, gw / 2, 72, 8, withAlpha('#000000', 0.7));
+                cv.strokeRoundRect(gx + gw / 4, gy + gh / 3, gw / 2, 72, 8, 1, withAlpha('#ffffff', 0.2));
+                cv.text('BRAK ZAPISANEGO PULLA', gx + gw / 2, gy + gh / 3 + 28, 22, t.dim, { align: 'center', font: 'bold' });
+                cv.text('Wykonaj przyspieszenie z gazem w podloge (WOT), aby narysowac wykres!', gx + gw / 2, gy + gh / 3 + 54, 17, t.text, { align: 'center' });
+            }
+
+            // --- PANEL PRAWY: ANALIZA STUKOWEGO I CYLINDRY ---
+            const rightX = 1076;
+            const rightW = 508;
+            G.panel(cv, t, rightX, topY, rightW, h, 'ANALIZA STUKOWEGO (DME B48)');
+
+            // Verdict Card
+            const hasKnock = (worstRetard <= thresh);
+            const hasMild = (!hasKnock && worstRetard <= -1.8);
+            const vCardH = 120;
+            const vCol = hasKnock ? CRIT : hasMild ? WARN : GO;
+
+            cv.roundRect(rightX + 24, topY + 58, rightW - 48, vCardH, 8, withAlpha(vCol, 0.18));
+            cv.strokeRoundRect(rightX + 24, topY + 58, rightW - 48, vCardH, 8, 2, vCol);
+
+            if (hasKnock) {
+                cv.text('WYKRYTO SPALANIE STUKOWE!', rightX + rightW / 2, topY + 86, 23, CRIT, { align: 'center', font: 'bold', spacing: 1.5 });
+                cv.text('Max korekta: ' + worstRetard.toFixed(1) + '° @ ' + worstRetardRpm + ' RPM (Cyl ' + worstRetardCyl + ')', rightX + rightW / 2, topY + 114, 19, t.text, { align: 'center', font: 'bold' });
+                cv.text('Moc w tym punkcie: ' + worstRetardHp + ' KM | Boost: ' + worstRetardBoost.toFixed(2) + ' bar', rightX + rightW / 2, topY + 138, 17, t.dim, { align: 'center' });
+                cv.text('Zalecenie: PB98 + dodatek Millers EcoMax!', rightX + rightW / 2, topY + 162, 17, CRIT, { align: 'center', font: 'bold' });
+            } else if (hasMild) {
+                cv.text('LEKKIE KOREKTY ZAPLONU (W NORMIE)', rightX + rightW / 2, topY + 86, 21, WARN, { align: 'center', font: 'bold' });
+                cv.text('Najwieksza korekta: ' + worstRetard.toFixed(1) + '° @ ' + worstRetardRpm + ' RPM (Cyl ' + worstRetardCyl + ')', rightX + rightW / 2, topY + 114, 18, t.text, { align: 'center' });
+                cv.text('DME cofa zaplon minimalnie. Paliwo na granicy.', rightX + rightW / 2, topY + 140, 16, t.dim, { align: 'center' });
+                cv.text('Dla bezpieczenstwa zalej sprawdzone paliwo 98/100.', rightX + rightW / 2, topY + 162, 16, WARN, { align: 'center' });
+            } else {
+                cv.text('ZAPLON STABILNY - BRAK STUKOWEGO', rightX + rightW / 2, topY + 88, 21, GO, { align: 'center', font: 'bold', spacing: 1 });
+                cv.text('Korekty zaplonu < 1.5° w calym zakresie RPM', rightX + rightW / 2, topY + 118, 18, t.text, { align: 'center' });
+                cv.text('Paliwo PB98 / EcoMax w pelni chroni silnik B48.', rightX + rightW / 2, topY + 144, 16, GO, { align: 'center' });
+                cv.text('Brak cofania kata wyprzedzenia na Stage 1.', rightX + rightW / 2, topY + 166, 16, t.dim, { align: 'center' });
+            }
+
+            // Per-Cylinder Peak Knock Breakdown
+            cv.text('MAKSYMALNE KOREKTY WG CYLINDROW (PEAK):', rightX + 24, topY + 204, 18, t.dim, { font: 'bold', spacing: 1 });
+
+            const cBoxW = (rightW - 48 - 24) / 4;
+            const cBoxY = topY + 218;
+            for (let c = 0; c < 4; c++) {
+                const bx = rightX + 24 + c * (cBoxW + 8);
+                let cPeak = 0.0;
+                let cPeakRpm = 0;
+                rpmBins.forEach((b) => {
+                    if (b.cylCorrs[c] < cPeak) {
+                        cPeak = b.cylCorrs[c];
+                        cPeakRpm = b.rpm;
+                    }
+                });
+
+                let cCol = GO;
+                if (cPeak <= thresh) cCol = CRIT;
+                else if (cPeak <= -1.5) cCol = WARN;
+
+                cv.roundRect(bx, cBoxY, cBoxW, 78, 6, withAlpha(cCol, 0.15));
+                cv.strokeRoundRect(bx, cBoxY, cBoxW, 78, 6, 1.5, cCol);
+
+                cv.text('CYL ' + (c + 1), bx + cBoxW / 2, cBoxY + 22, 17, t.dim, { align: 'center', font: 'bold' });
+                cv.text(cPeak.toFixed(1) + '°', bx + cBoxW / 2, cBoxY + 46, 21, cCol, { align: 'center', font: 'num' });
+                cv.text(cPeak < 0 ? (cPeakRpm + ' rpm') : 'OK', bx + cBoxW / 2, cBoxY + 68, 14, t.dim, { align: 'center' });
+            }
+
+            // Pull Summary Stats
+            const sY = topY + 316;
+            cv.fillRect(rightX + 24, sY, rightW - 48, 1, withAlpha('#ffffff', 0.12));
+            cv.text('PARAMETRY SZCZYTOWE PULLA:', rightX + 24, sY + 26, 18, t.dim, { font: 'bold', spacing: 1 });
+
+            cv.text('• Szczytowa moc systemowa:', rightX + 24, sY + 54, 18, t.text);
+            cv.text(peakHold.systemHp + ' KM', rightX + rightW - 24, sY + 54, 20, GO, { align: 'right', font: 'num' });
+
+            cv.text('• Szczytowy moment obrotowy:', rightX + 24, sY + 80, 18, t.text);
+            cv.text(peakHold.systemTorque + ' Nm', rightX + rightW - 24, sY + 80, 20, BLUE, { align: 'right', font: 'num' });
+
+            cv.text('• Maksymalne doladowanie B48:', rightX + 24, sY + 106, 18, t.text);
+            cv.text(liveDiag.peakBoost.toFixed(2) + ' bar', rightX + rightW - 24, sY + 106, 20, t.text, { align: 'right', font: 'num' });
+
+            // Hint
+            cv.text('Dolny przycisk [Resetuj Wykres] zeruje logi przed kolejnym testem', rightX + rightW / 2, topY + 448, 15, t.dim, { align: 'center' });
+        }
+
+        /* =========================================================================
+         * TAB 3: WARMUP & TURBO (Ochrona Zimnego B48, Dynamiczny Limit, Cooldown)
+         * ========================================================================= */
+        function renderTab3_WarmupTurbo(cv, t, p) {
             const colW = 764;
             const topY = 46;
             const h = 466;
@@ -1019,9 +1416,9 @@ mgu.run({
         }
 
         /* =========================================================================
-         * TAB 3: SERVICE TRACKER (Inteligentny Licznik Przebiegu B48 vs EV)
+         * TAB 4: SERVICE TRACKER (Inteligentny Licznik Przebiegu B48 vs EV)
          * ========================================================================= */
-        function renderTab3_ServiceTracker(cv, t) {
+        function renderTab4_ServiceTracker(cv, t) {
             const topY = 46;
             const h = 466;
 
