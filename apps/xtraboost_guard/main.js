@@ -107,7 +107,29 @@ mgu.run({
                 try {
                     diag = new ReadOnlyDiag(ctx.signals, log, { silentAfter: 30, gapMs: 25 });
                     diag.init()
-                        .then(() => log.info('ReadOnlyDiag connected to DME (0x12) & SME (0x07) successfully'))
+                        .then(async () => {
+                            log.info('ReadOnlyDiag connected to DME (0x12) & SME (0x07) successfully');
+                            try {
+                                const rSoc = await diag.read(0x07, 0xDDBC, 1000);
+                                if (rSoc && rSoc[0] === 0x62 && rSoc.length >= 5) {
+                                    const s = ((rSoc[3] << 8) | rSoc[4]) * 0.1;
+                                    if (s >= 0 && s <= 100) {
+                                        liveDiag.soc = Math.round(s * 10) / 10;
+                                        liveDiag.socReal = true;
+                                        liveDiag.bmsRealData = true;
+                                    }
+                                }
+                                const rLim = await diag.read(0x07, 0xDD7D, 1000);
+                                if (rLim && rLim[0] === 0x62 && rLim.length >= 7) {
+                                    const d = ((rLim[5] << 8) | rLim[6]) * 0.1;
+                                    if (d > 10 && d < 600) {
+                                        liveDiag.dischargeLimitA = d;
+                                    }
+                                }
+                            } catch (e) {
+                                log.warn('Initial SME read error: ' + e);
+                            }
+                        })
                         .catch((e) => log.warn('ReadOnlyDiag init warning: ' + e));
                 } catch (e) {
                     log.warn('ReadOnlyDiag creation warning: ' + e);
@@ -236,7 +258,8 @@ mgu.run({
             peakBoost: 0.0,
             peakIat: 0.0,
             peakCorr: [0.0, 0.0, 0.0, 0.0],
-            soc: 65,
+            soc: null,
+            socReal: false,
             hvVolts: 350.0,
             hvAmps: 0.0,
             dischargeLimitA: 260.0,
@@ -311,9 +334,21 @@ mgu.run({
             diagBusy = true;
             try {
                 if (diag.silent && diag.silent(0x07)) diag.wake(0x07);
-                smeStep = (smeStep + 1) % 4;
+                smeStep = (smeStep + 1) % 6;
                 if (smeStep === 1) {
-                    // Step 1: Read SME Discharge Limit (DID 0xDD7D - single DID read)
+                    // Step 1: Read SME Battery State of Charge (DID 0xDDBC - Real HV SoC %)
+                    const reply = await diag.read(0x07, 0xDDBC, 800);
+                    if (reply && reply[0] === 0x62 && reply.length >= 5) {
+                        const rawSoc = (reply[3] << 8) | reply[4];
+                        const soc = rawSoc * 0.1;
+                        if (soc >= 0 && soc <= 100) {
+                            liveDiag.soc = Math.round(soc * 10) / 10;
+                            liveDiag.socReal = true;
+                            liveDiag.bmsRealData = true;
+                        }
+                    }
+                } else if (smeStep === 3) {
+                    // Step 3: Read SME Discharge Limit (DID 0xDD7D - single DID read)
                     const reply = await diag.read(0x07, 0xDD7D, 800);
                     if (reply && reply[0] === 0x62 && reply.length >= 7) {
                         const rawDischarge = (reply[5] << 8) | reply[6];
@@ -323,8 +358,8 @@ mgu.run({
                             liveDiag.bmsRealData = true;
                         }
                     }
-                } else if (smeStep === 3) {
-                    // Step 3: Read SME Voltage (DID 0xDDB4 - single DID read)
+                } else if (smeStep === 5) {
+                    // Step 5: Read SME Voltage (DID 0xDDB4 - single DID read)
                     const reply = await diag.read(0x07, 0xDDB4, 800);
                     if (reply && reply[0] === 0x62 && reply.length >= 5) {
                         const rawV = (reply[3] << 8) | reply[4];
@@ -334,7 +369,7 @@ mgu.run({
                         }
                     }
                 } else {
-                    // Steps 0 and 2: Read SME High Voltage Battery Current (DID 0xDD69 - single DID read)
+                    // Steps 0, 2, 4: Read SME High Voltage Battery Current (DID 0xDD69) - frequent traction reads!
                     const reply = await diag.read(0x07, 0xDD69, 800);
                     if (reply && reply[0] === 0x62 && reply.length >= 7) {
                         const rawA = Buffer.from(reply).readInt32BE(3);
@@ -475,7 +510,7 @@ mgu.run({
                 const dt = Math.min(0.1, Math.max(0.001, (now - lastCooldownTick) / 1000));
                 lastCooldownTick = now;
 
-                const isDemo = (!diag || !diag.ready) || settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && d.demo);
+                const isDemo = settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && d.demo && !car.carPresent());
                 if (isDemo) {
                     updateDemoState(d, dt);
                 }
@@ -484,34 +519,49 @@ mgu.run({
                 const totalTorque = (G.isNum(d.torque) && d.torque > 0) ? d.torque : 0;
                 const isIceRunning = (rpm >= 500);
 
-                // 2. Real BMS derating calculation from SME battery limits (NO hardcoded 30% rule!)
-                const soc = G.isNum(liveDiag.soc) ? liveDiag.soc : 60;
+                // 2. Real High-Voltage Battery SoC and BMS Derating calculation
+                const hasRealSoc = G.isNum(liveDiag.soc);
+                const soc = hasRealSoc ? liveDiag.soc : 0;
                 let derateRatio = 1.0;
 
+                // 2a. BMS physical discharge limit (kW) from DID 0xDD7D & Voltage
+                let bmsDerate = 1.0;
                 if (liveDiag.bmsRealData && liveDiag.hvVolts > 180 && liveDiag.dischargeLimitA > 10) {
-                    // Physical max discharge power allowed by BMW BMS (kW)
                     const maxBmsKw = (liveDiag.hvVolts * liveDiag.dischargeLimitA) / 1000;
-                    // Full 109 HP (80 kW mechanical) requires ~84 kW electrical from the battery
-                    if (maxBmsKw < 84.0) {
-                        derateRatio = G.clamp(maxBmsKw / 84.0, 0.15, 1.0);
-                    } else {
-                        derateRatio = 1.0;
-                    }
-                } else {
-                    // Fallback when SME is still connecting or idle:
-                    // Only derate when SoC is genuinely low (< 15%)
-                    if (soc < 15) {
-                        derateRatio = G.clamp(0.40 + (soc / 15) * 0.60, 0.40, 1.0);
-                    } else {
-                        derateRatio = 1.0;
+                    if (maxBmsKw < 86.0) {
+                        bmsDerate = G.clamp(maxBmsKw / 86.0, 0.20, 1.0);
                     }
                 }
+
+                // 2b. Samsung SDI NMC Battery SoC Discharge Capacity Curve (BMW G30 530e):
+                // - SoC >= 25%: 100% full discharge rate allowed (109 HP / 265 Nm) -> Full 420 KM!
+                // - SoC 15% - 25%: Linear transition from 75% to 100% (82 HP - 109 HP)
+                // - SoC 5% - 15% (Hybrid Reserve buffer): 30% to 75% (33 HP - 82 HP)
+                // - SoC < 5%: Minimum buffer floor (25% power / ~27 HP)
+                let socDerate = 1.0;
+                if (hasRealSoc) {
+                    if (soc <= 5) {
+                        socDerate = 0.25;
+                    } else if (soc < 15) {
+                        socDerate = 0.25 + ((soc - 5) / 10) * 0.50;
+                    } else if (soc < 25) {
+                        socDerate = 0.75 + ((soc - 15) / 10) * 0.25;
+                    } else {
+                        socDerate = 1.0;
+                    }
+                } else {
+                    // While waiting for initial UDS read: assume moderate power until confirmed
+                    socDerate = 0.80;
+                }
+
+                derateRatio = Math.min(bmsDerate, socDerate);
                 liveDiag.derateRatio = derateRatio;
 
                 const evMaxHp = Math.round(SPEC.evMaxHp * derateRatio);
                 const evMaxNm = Math.round(SPEC.evMaxNm * derateRatio);
                 const lostHp = SPEC.evMaxHp - evMaxHp;
                 const lostNm = SPEC.evMaxNm - evMaxNm;
+                const maxSystemHp = SPEC.iceMaxHp + evMaxHp;
 
                 // 3. Real Electric Motor Power and Torque from HV battery current & Powertrain Split
                 let iceHp = 0, iceTorque = 0, evHp = 0, evTorque = 0;
@@ -594,20 +644,24 @@ mgu.run({
 
                 const oilOk = (oilTemp >= 85 && oilTemp <= 108);
                 const iatOk = (liveDiag.iat < 45);
-                const bmsOk = (derateRatio >= 0.98);
+                const bmsOk = hasRealSoc && (soc >= 25) && (derateRatio >= 0.98);
                 const ready100_200 = oilOk && iatOk && bmsOk;
 
                 const badges = [];
                 if (isDemo) badges.push({ text: 'DEMO', color: 'accent' });
                 if (cooldownRemaining > 0) badges.push({ text: 'COOLDOWN ' + Math.ceil(cooldownRemaining) + 's', color: 'warn' });
-                if (ready100_200) badges.push({ text: '420 KM READY', color: GO });
+                if (ready100_200) {
+                    badges.push({ text: '420 KM READY', color: GO });
+                } else if (hasRealSoc && soc < 25) {
+                    badges.push({ text: 'BMS LIMIT (' + maxSystemHp + ' KM)', color: 'warn' });
+                }
 
                 G.frame(cv, t, TABS, activeTab, badges);
 
                 if (activeTab === 0) {
                     renderTab1_XtraBoostGuard(cv, t, {
                         rpm, iceHp, iceTorque, evHp, evTorque, evMaxHp, evMaxNm,
-                        lostHp, lostNm, derateRatio, soc, systemHp, ready100_200,
+                        lostHp, lostNm, derateRatio, soc, hasRealSoc, maxSystemHp, systemHp, ready100_200,
                         oilOk, iatOk, bmsOk, oilTemp
                     });
                 } else if (activeTab === 1) {
@@ -680,7 +734,8 @@ mgu.run({
             });
 
             cv.fillRect(36, topY + 236, colW - 40, 1, withAlpha('#ffffff', 0.12));
-            cv.text('SILNIK ELEKTRYCZNY (EME - XTRABOOST)', 36, topY + 264, 20, p.derateRatio < 0.98 ? WARN : M_CYAN, { font: 'bold' });
+            const socTxt = p.hasRealSoc ? (p.soc.toFixed(1) + '% SoC') : 'Odczyt...';
+            cv.text('SILNIK ELEKTRYCZNY (EME) | ' + socTxt, 36, topY + 264, 19, p.derateRatio < 0.98 ? WARN : M_CYAN, { font: 'bold' });
 
             G.bar(cv, t, 36, topY + 272, colW - 40, 60, {
                 label: 'MOC ELEKTRYCZNA',
@@ -704,20 +759,18 @@ mgu.run({
                 peak: p.evMaxNm
             });
 
+            const bmsCardY = topY + 414;
+            const bmsCardH = 48;
             if (p.derateRatio < 0.98) {
-                cv.roundRect(36, topY + 418, colW - 40, 42, 6, withAlpha(WARN, 0.22));
-                cv.strokeRoundRect(36, topY + 418, colW - 40, 42, 6, 1.5, WARN);
-                const limitTxt = liveDiag.bmsRealData
-                    ? 'BMS LIMIT: -' + p.lostHp + ' KM / -' + p.lostNm + ' Nm (BMS ' + liveDiag.dischargeLimitA.toFixed(0) + 'A | SoC ' + p.soc.toFixed(0) + '%)'
-                    : 'BMS LIMIT: -' + p.lostHp + ' KM / -' + p.lostNm + ' Nm (SoC ' + p.soc.toFixed(0) + '%)';
-                cv.text(limitTxt, 36 + (colW - 40) / 2, topY + 444, 16, WARN, { align: 'center', font: 'bold' });
+                cv.roundRect(36, bmsCardY, colW - 40, bmsCardH, 6, withAlpha(WARN, 0.22));
+                cv.strokeRoundRect(36, bmsCardY, colW - 40, bmsCardH, 6, 1.5, WARN);
+                cv.text('BMS LIMIT: -' + p.lostHp + ' KM / -' + p.lostNm + ' Nm (DOSTEPNE: ' + p.evMaxHp + ' KM / ' + p.evMaxNm + ' Nm)', 36 + (colW - 40) / 2, bmsCardY + 19, 16, WARN, { align: 'center', font: 'bold' });
+                cv.text('BATERIA: ' + socTxt + ' | DO PELNYCH 109 KM WYMAGANE: >= 25%', 36 + (colW - 40) / 2, bmsCardY + 38, 14, t.text, { align: 'center' });
             } else {
-                cv.roundRect(36, topY + 418, colW - 40, 42, 6, withAlpha(GO, 0.15));
-                cv.strokeRoundRect(36, topY + 418, colW - 40, 42, 6, 1.5, withAlpha(GO, 0.6));
-                const okTxt = liveDiag.bmsRealData
-                    ? 'XTRABOOST 100% (109 KM / 265 Nm) | BMS: ' + liveDiag.dischargeLimitA.toFixed(0) + 'A | SoC: ' + p.soc.toFixed(0) + '%'
-                    : 'XTRABOOST 100% (109 KM / 265 Nm OK) | SoC: ' + p.soc.toFixed(0) + '%';
-                cv.text(okTxt, 36 + (colW - 40) / 2, topY + 444, 16, GO, { align: 'center', font: 'bold' });
+                cv.roundRect(36, bmsCardY, colW - 40, bmsCardH, 6, withAlpha(GO, 0.15));
+                cv.strokeRoundRect(36, bmsCardY, colW - 40, bmsCardH, 6, 1.5, withAlpha(GO, 0.6));
+                cv.text('XTRABOOST 100% ODBLOKOWANY (109 KM / 265 Nm)', 36 + (colW - 40) / 2, bmsCardY + 19, 16, GO, { align: 'center', font: 'bold' });
+                cv.text('BATERIA: ' + socTxt + ' (POWYZEJ PROGU 25% | PELNE 420 KM OK)', 36 + (colW - 40) / 2, bmsCardY + 38, 14, GO, { align: 'center' });
             }
 
             const midX = 534;
@@ -729,7 +782,7 @@ mgu.run({
             const pw = cv.text(pwrStr, midX + midW / 2 - 32, topY + 145, 84, p.systemHp >= 400 ? GO : t.text, { align: 'center', font: 'num' });
             cv.text('KM', midX + midW / 2 + pw / 2 + 10, topY + 138, 32, t.dim, { font: 'bold' });
 
-            G.bar(cv, t, midX + 30, topY + 158, midW - 60, 48, {
+            G.bar(cv, t, midX + 30, topY + 158, midW - 60, 44, {
                 label: '',
                 head: false,
                 value: p.systemHp,
@@ -739,40 +792,49 @@ mgu.run({
                 zones: [{ from: 410, to: 450, color: GO }]
             });
 
-            cv.fillRect(midX + 30, topY + 224, midW - 60, 1, withAlpha('#ffffff', 0.12));
-            cv.text('STATUS GOTOWOSCI DO POMIARU 100-200 KM/H', midX + midW / 2, topY + 252, 20, t.text, { align: 'center', font: 'bold' });
+            // Prominent Max Available System Power indicator
+            const capTxt = (p.derateRatio < 0.98)
+                ? 'MAKS. MOC TERAZ: ' + p.maxSystemHp + ' KM (B48: 311 KM + EME: ' + p.evMaxHp + ' KM)'
+                : 'MAKS. MOC TERAZ: 420 KM (PELNY XTRABOOST ODBLOKOWANY)';
+            const capCol = (p.derateRatio < 0.98) ? WARN : GO;
+            cv.text(capTxt, midX + midW / 2, topY + 224, 18, capCol, { align: 'center', font: 'bold' });
 
-            const rCardY = topY + 268;
-            const rCardH = 188;
+            cv.fillRect(midX + 30, topY + 236, midW - 60, 1, withAlpha('#ffffff', 0.12));
+            cv.text('STATUS GOTOWOSCI DO POMIARU 100-200 KM/H', midX + midW / 2, topY + 258, 19, t.text, { align: 'center', font: 'bold' });
+
+            const rCardY = topY + 274;
+            const rCardH = 182;
             if (p.ready100_200) {
                 cv.roundRect(midX + 30, rCardY, midW - 60, rCardH, 10, withAlpha(GO, 0.22));
                 cv.strokeRoundRect(midX + 30, rCardY, midW - 60, rCardH, 10, 2, GO);
-                cv.text('GOTOWY - 420 KM', midX + midW / 2, rCardY + 48, 38, GO, { align: 'center', font: 'bold', spacing: 2 });
-                cv.text('(100-200 READY - PELNA MOC)', midX + midW / 2, rCardY + 84, 22, GO, { align: 'center', font: 'bold' });
+                cv.text('GOTOWY - 420 KM', midX + midW / 2, rCardY + 44, 36, GO, { align: 'center', font: 'bold', spacing: 2 });
+                cv.text('(100-200 READY - PELNA MOC)', midX + midW / 2, rCardY + 76, 20, GO, { align: 'center', font: 'bold' });
 
-                cv.fillRect(midX + 60, rCardY + 104, midW - 120, 1, withAlpha(GO, 0.3));
-                cv.text('✓ Temp. oleju: ' + p.oilTemp.toFixed(0) + '°C (85-108°C)', midX + 60, rCardY + 130, 20, t.text);
-                cv.text('✓ Temp. dolotu (IAT): ' + liveDiag.iat.toFixed(0) + '°C (< 45°C)', midX + 60, rCardY + 154, 20, t.text);
-                cv.text('✓ Bateria XtraBoost: 100% mocy elektryka', midX + 60, rCardY + 178, 20, t.text);
+                cv.fillRect(midX + 60, rCardY + 94, midW - 120, 1, withAlpha(GO, 0.3));
+                cv.text('✓ Bateria XtraBoost: ' + socTxt + ' (min. 25% | 100% mocy odblokowane)', midX + 60, rCardY + 120, 19, t.text);
+                cv.text('✓ Temp. oleju B48: ' + p.oilTemp.toFixed(0) + '°C (85-108°C)', midX + 60, rCardY + 144, 19, t.text);
+                cv.text('✓ Temp. dolotu (IAT): ' + liveDiag.iat.toFixed(0) + '°C (< 45°C)', midX + 60, rCardY + 168, 19, t.text);
             } else {
                 const cardCol = (!p.oilOk && p.oilTemp < 60) ? CRIT : WARN;
                 cv.roundRect(midX + 30, rCardY, midW - 60, rCardH, 10, withAlpha(cardCol, 0.16));
                 cv.strokeRoundRect(midX + 30, rCardY, midW - 60, rCardH, 10, 2, cardCol);
-                cv.text('BLOKADA POMIARU 100-200', midX + midW / 2, rCardY + 42, 30, cardCol, { align: 'center', font: 'bold', spacing: 1.5 });
+                cv.text('BLOKADA POMIARU 100-200', midX + midW / 2, rCardY + 38, 28, cardCol, { align: 'center', font: 'bold', spacing: 1.5 });
 
-                let by = rCardY + 82;
+                let by = rCardY + 72;
+                if (!p.bmsOk) {
+                    cv.text('✗ Bateria: ' + socTxt + ' (Wymagane min. 25% do 420 KM)', midX + 50, by, 20, WARN, { font: 'bold' });
+                    by += 24;
+                    cv.text('  Ubytek: -' + p.lostHp + ' KM | Maks. moc teraz: ' + p.maxSystemHp + ' KM', midX + 50, by, 18, t.text);
+                    by += 26;
+                }
                 if (!p.oilOk) {
-                    const why = p.oilTemp < 85 ? 'Zimny olej (' + p.oilTemp.toFixed(0) + '°C < 85°C)' : 'Za goracy olej (' + p.oilTemp.toFixed(0) + '°C > 108°C)';
-                    cv.text('✗ ' + why, midX + 50, by, 21, CRIT, { font: 'bold' });
-                    by += 28;
+                    const why = p.oilTemp < 85 ? 'Zimny olej B48 (' + p.oilTemp.toFixed(0) + '°C < 85°C)' : 'Za goracy olej B48 (' + p.oilTemp.toFixed(0) + '°C > 108°C)';
+                    cv.text('✗ ' + why, midX + 50, by, 20, CRIT, { font: 'bold' });
+                    by += 26;
                 }
                 if (!p.iatOk) {
-                    cv.text('✗ Za wysoka IAT (' + liveDiag.iat.toFixed(0) + '°C >= 45°C)', midX + 50, by, 21, WARN, { font: 'bold' });
-                    by += 28;
-                }
-                if (!p.bmsOk) {
-                    cv.text('✗ BMS obcina moc elektryka (SoC ' + p.soc.toFixed(0) + '%)', midX + 50, by, 21, WARN, { font: 'bold' });
-                    by += 28;
+                    cv.text('✗ Za wysoka IAT (' + liveDiag.iat.toFixed(0) + '°C >= 45°C)', midX + 50, by, 20, WARN, { font: 'bold' });
+                    by += 26;
                 }
             }
 
